@@ -1,0 +1,16 @@
+[Unit]
+Description=NC Privileged Helper
+Requires=nc-privileged-helper.socket
+After=nc-privileged-helper.socket
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=@NODE_BIN@ /opt/nc/app/privileged-helper-linux-daemon.mjs
+Restart=on-failure
+RestartSec=5
+UMask=0077
+PrivateTmp=true
+ProtectHome=true
+RestrictAddressFamilies=AF_UNIX

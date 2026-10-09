@@ -1,0 +1,14 @@
+[Unit]
+Description=NC Privileged Helper Socket
+
+[Socket]
+ListenStream=/run/nc/privileged-helper-v1.sock
+SocketUser=root
+SocketGroup=@NC_SERVICE_GROUP@
+SocketMode=0660
+DirectoryMode=0750
+RemoveOnStop=true
+Accept=no
+
+[Install]
+WantedBy=sockets.target
