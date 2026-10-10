@@ -1,10 +1,10 @@
 {
-  "name": "nodecommand",
+  "name": "nc-agent",
   "version": "0.17.28",
   "license": "Apache-2.0",
   "type": "module",
   "bin": {
-    "nodecommand": "bin/nodecommand.mjs"
+    "nc-agent": "bin/nc.mjs"
   },
   "files": [
     "bin",
