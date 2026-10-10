@@ -9,10 +9,13 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = path.resolve(HERE, '..');
 
-const USAGE = `nc-agent — Node Command host agent installer
+const USAGE = `nodecommand-agent — Node Command host agent installer
 
 Usage:
-  npx nc-agent [options]
+  npx nodecommand-agent@latest install [options]
+
+Commands:
+  install          Stage the runtime tree and run the platform installer (default)
 
 Options:
   --help, -h       Show this help message
@@ -91,6 +94,15 @@ async function main() {
     process.exit(0);
   }
 
+  // `install` is the only explicit command; running the bin with no command
+  // also installs (npx nodecommand-agent@latest works bare).
+  const positional = args.filter((a) => !a.startsWith('-'));
+  if (positional.length > 0 && positional[0] !== 'install') {
+    console.error(`Error: Unknown command "${positional[0]}".`);
+    process.stdout.write(USAGE);
+    process.exit(1);
+  }
+
   const platform = process.platform;
   if (!['win32', 'darwin', 'linux'].includes(platform)) {
     console.error(`Error: Unsupported platform "${platform}". Node Command agent supports linux, darwin, and win32.`);
@@ -107,7 +119,7 @@ async function main() {
   let stageDir = null;
 
   try {
-    stageDir = mkdtempSync(path.join(os.tmpdir(), 'nc-agent-stage-'));
+    stageDir = mkdtempSync(path.join(os.tmpdir(), 'nodecommand-agent-stage-'));
     const releaseModulePath = pathToFileURL(
       path.join(PKG_ROOT, 'scripts/package-release.mjs')
     ).href;
@@ -142,18 +154,22 @@ async function main() {
       } catch {}
     }
   };
-  process.on('SIGINT', () => { cleanup(); process.exit(130); });
-  process.on('SIGTERM', () => { cleanup(); process.exit(143); });
 
   let command;
   let commandArgs;
-
   if (platform === 'win32') {
     command = 'powershell';
-    commandArgs = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath, ...args];
-  } else if (platform === 'darwin' || platform === 'linux') {
+    commandArgs = [
+      '-NoProfile',
+      '-ExecutionPolicy',
+      'Bypass',
+      '-File',
+      scriptPath,
+      ...args.filter((a) => a !== 'install')
+    ];
+  } else {
     command = 'bash';
-    commandArgs = [scriptPath, ...args];
+    commandArgs = [scriptPath, ...args.filter((a) => a !== 'install')];
   }
 
   let exitCode = 1;
@@ -162,8 +178,13 @@ async function main() {
   } finally {
     cleanup();
   }
-
   process.exit(exitCode);
 }
 
-main();
+process.on('SIGINT', () => process.exit(130));
+process.on('SIGTERM', () => process.exit(143));
+
+main().catch((err) => {
+  console.error(`Error: ${err?.message || err}`);
+  process.exit(1);
+});
