@@ -1,27 +1,23 @@
 {
-  "name": "nodecommand-agent",
+  "name": "nc-agent",
   "version": "0.1.0",
   "license": "Apache-2.0",
   "type": "module",
   "bin": {
-    "nodecommand-agent": "bin/nodecommand-agent.mjs"
+    "nc-agent": "bin/nc.mjs"
   },
   "files": [
     "bin",
-    "src",
-    "installers",
-    "gui-broker",
-    "privileged-helper",
-    "native",
-    "install",
-    "scripts"
+    "lib",
+    "README.md",
+    "LICENSE"
   ],
   "engines": {
     "node": ">=24"
   },
   "scripts": {
     "start": "node src/client/launcher.mjs",
-    "package": "node scripts/package-release.mjs",
     "test": "node --test tests/*.mjs"
-  }
+  },
+  "description": "Node Command device pairing and agent installer. Run npx nc-agent to pair this machine via the browser device flow; the agent is downloaded from the control plane."
 }
