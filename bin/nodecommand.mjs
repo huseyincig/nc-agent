@@ -9,10 +9,10 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = path.resolve(HERE, '..');
 
-const USAGE = `nc-agent — Node Command host agent installer
+const USAGE = `nodecommand — Node Command host agent installer
 
 Usage:
-  npx nc-agent [options]
+  npx nodecommand [options]
 
 Options:
   --help, -h       Show this help message
@@ -107,7 +107,7 @@ async function main() {
   let stageDir = null;
 
   try {
-    stageDir = mkdtempSync(path.join(os.tmpdir(), 'nc-agent-stage-'));
+    stageDir = mkdtempSync(path.join(os.tmpdir(), 'nodecommand-stage-'));
     const releaseModulePath = pathToFileURL(
       path.join(PKG_ROOT, 'scripts/package-release.mjs')
     ).href;

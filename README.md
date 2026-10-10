@@ -1,4 +1,4 @@
-# nc-agent
+# nodecommand
 
 Public Node Command endpoint runtime (Linux / Windows / macOS). Canonical agent source.
 
@@ -13,7 +13,7 @@ helper, GUI broker, self-updater, installers, uninstall.
 Install the agent on Linux, macOS, or Windows using `npx`:
 
 ```bash
-npx nc-agent
+npx nodecommand
 ```
 
 This automatically detects your operating system and invokes the corresponding native installer.
@@ -32,7 +32,7 @@ Configuration flags can be passed via environment variables:
 Example (user-mode installation):
 
 ```bash
-NC_USER_INSTALL=1 npx nc-agent
+NC_USER_INSTALL=1 npx nodecommand
 ```
 
 ### Manual Installation (from Git)
