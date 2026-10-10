@@ -1722,15 +1722,19 @@ async function runDeviceFlow({ installMode = undefined, ncRoot = undefined } = {
   const dim = '\x1b[2m';
   const reset = '\x1b[0m';
 
-  const completeUrl = verification_uri_complete || `${verification_uri}?user_code=${encodeURIComponent(user_code)}`;
+  // Print the CLEAN verification_uri (no ?user_code= query). The /device page
+  // has a manual 8-character code input; the deep-link form is useless here
+  // because the login redirect strips the query (return_to=/device only), so
+  // the code would never auto-fill after sign-in anyway.
+  const verifyUrl = verification_uri || `${baseUrl}/device`;
 
   printBox([
     { text: `${bold}Node Command — Device Authorization${reset}`, rawLength: 'Node Command — Device Authorization'.length },
     { text: '', rawLength: 0 },
-    { text: 'To complete pairing, visit this URL in your browser:', rawLength: 'To complete pairing, visit this URL in your browser:'.length },
-    { text: `${cyan}${bold}${completeUrl}${reset}`, rawLength: completeUrl.length },
+    { text: 'To complete pairing, open this URL in your browser:', rawLength: 'To complete pairing, open this URL in your browser:'.length },
+    { text: `${cyan}${bold}${verifyUrl}${reset}`, rawLength: verifyUrl.length },
     { text: '', rawLength: 0 },
-    { text: `Confirmation Code: ${yellow}${bold}${user_code}${reset}`, rawLength: `Confirmation Code: ${user_code}`.length },
+    { text: `Then enter this code on the page: ${yellow}${bold}${user_code}${reset}`, rawLength: `Then enter this code on the page: ${user_code}`.length },
     { text: '', rawLength: 0 },
     { text: `${dim}Waiting for approval in browser...${reset}`, rawLength: 'Waiting for approval in browser...'.length }
   ]);
