@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 $Root = 'C:\NC'
 $TaskName = 'NC Client'
-$Src = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$Src = if ($env:NC_SRC) { (Resolve-Path $env:NC_SRC).Path } else { (Resolve-Path (Join-Path $PSScriptRoot '..')).Path }
 $Stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
   throw 'Administrator privileges required'

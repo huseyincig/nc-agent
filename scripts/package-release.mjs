@@ -350,7 +350,7 @@ export async function buildBrowserRuntime({
  * @param {string} version
  * @param {string|null} [browserRuntimeDir] prebuilt payload dir containing browser-runtime/
  */
-async function stageRuntime(stage, version, browserRuntimeDir = null) {
+export async function stageRuntime(stage, version, browserRuntimeDir = null) {
   await fs.mkdir(stage, { recursive: true });
   for (const name of RUNTIME_FILES) {
     const dest = path.join(stage, name);

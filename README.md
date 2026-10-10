@@ -8,6 +8,51 @@ Connection runtime, device authentication, shell/filesystem execution,
 browser adapter, egress enforcement, host-policy enforcement, privileged
 helper, GUI broker, self-updater, installers, uninstall.
 
+## Installation
+
+Install the agent on Linux, macOS, or Windows using `npx`:
+
+```bash
+npx nc-agent
+```
+
+This automatically detects your operating system and invokes the corresponding native installer.
+
+### Advanced Options & Configuration
+
+Configuration flags can be passed via environment variables:
+
+- `NC_ROOT`: Target installation directory.
+  - Linux: default `/opt/nc` (system) or `~/.local/share/nc` (user mode).
+  - macOS: default `/opt/nc` (system) or `~/Library/Application Support/nc` (user mode).
+  - Windows: default `C:\NC`.
+- `NC_USER_INSTALL=1`: Force user-level installation without root or administrative elevation.
+- `NC_SYSTEM_INSTALL=1`: Require system-level service installation (requires root/admin elevation).
+
+Example (user-mode installation):
+
+```bash
+NC_USER_INSTALL=1 npx nc-agent
+```
+
+### Manual Installation (from Git)
+
+If you prefer to install without `npx`, clone the repository and run the installer directly:
+
+```bash
+git clone https://github.com/huseyincig/nc-agent.git
+cd nc-agent
+
+# Linux
+bash installers/linux/install-linux.sh
+
+# macOS
+bash installers/macos/install-macos.sh
+
+# Windows (Run PowerShell as Administrator)
+powershell -NoProfile -ExecutionPolicy Bypass -File installers\windows\install-windows.ps1
+```
+
 ## Layout
 
 ```text

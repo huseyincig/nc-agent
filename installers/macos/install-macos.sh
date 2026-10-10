@@ -4,7 +4,7 @@ set -euo pipefail
 trap 'echo "NC macOS install failed at line $LINENO (exit $?)" >&2' ERR
 ROOT="${NC_ROOT:-/opt/nc}"
 PLIST=/Library/LaunchDaemons/com.nc.client.plist
-SRC="$(cd "$(dirname "$0")/.." && pwd)"
+SRC="${NC_SRC:-$(cd "$(dirname "$0")/.." && pwd)}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 # Privilege model: root installs target the machine tree; anything else is a
 # per-user install into the operator's own tree with zero elevation.

@@ -2,7 +2,7 @@
 set -euo pipefail
 ROOT="${NC_ROOT:-/opt/nc}"
 UNIT=/etc/systemd/system/nc-client.service
-SRC="$(cd "$(dirname "$0")/.." && pwd)"
+SRC="${NC_SRC:-$(cd "$(dirname "$0")/.." && pwd)}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 # Idempotent system-level refresh for `install.sh --update` (single source).
 # `install-linux.sh --upgrade` refreshes journal membership, directory
