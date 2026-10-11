@@ -182,6 +182,35 @@ async function checkUrl(url, policy) {
 }
 
 /**
+ * Enforce egress filter installation fail-closed.
+ * @param {import('./browser-manager.mjs').BrowserManager} manager
+ * @param {string} key
+ * @param {any} session
+ */
+async function enforceContextEgressFilter(manager, key, session) {
+  if (!session?.context) return;
+  try {
+    await installContextEgressFilter(session.context, session);
+  } catch (err) {
+    try {
+      if (typeof session.context?.close === 'function') await session.context.close();
+    } catch {}
+    try {
+      if (session.ownsBrowser && typeof session.browser?.close === 'function') {
+        await session.browser.close();
+      }
+    } catch {}
+    try {
+      const targetId = session.id || key;
+      await manager.closeSession(targetId, 'egress-filter-failed');
+    } catch {}
+    const msg = err && typeof err === 'object' && 'message' in err ? String(err.message) : '';
+    if (/^BROWSER_[A-Z_]+/.test(msg)) throw err;
+    throw Object.assign(new Error('BROWSER_EGRESS_FILTER_FAILED'), { cause: err });
+  }
+}
+
+/**
  * @param {unknown} job
  * @returns {Promise<Record<string, any>>}
  */
@@ -243,7 +272,7 @@ export async function browserCreateJob(job) {
       downloadsDir: null
     });
     if (session?.context) {
-      await installContextEgressFilter(session.context, session);
+      await enforceContextEgressFilter(manager, key, session);
     }
     const v = manager.versions();
     return okJob(
@@ -335,7 +364,7 @@ export async function browserNavigateJob(job) {
       session.policy.network = policy.network;
     }
     if (session?.context) {
-      await installContextEgressFilter(session.context, session);
+      await enforceContextEgressFilter(manager, key, session);
     }
     const s = session;
     return /** @type {Record<string, unknown>} */ (

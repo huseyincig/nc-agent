@@ -519,7 +519,7 @@ function whereExe(name) {
   return first || null;
 }
 
-function resolveAppTarget(app, target) {
+export function resolveAppTarget(app, target) {
   const env = process.env;
   switch (app) {
     case 'default_browser':
@@ -565,22 +565,42 @@ function resolveAppTarget(app, target) {
     case 'notepad':
       return { file: 'notepad.exe', args: target ? [target] : [] };
     case 'code': {
-      const exe =
+      let exe =
         firstExisting([
           path.join(env.LOCALAPPDATA || '', 'Programs', 'Microsoft VS Code', 'Code.exe'),
-          path.join(env.ProgramFiles || '', 'Microsoft VS Code', 'Code.exe')
+          path.join(env.ProgramFiles || '', 'Microsoft VS Code', 'Code.exe'),
+          path.join(env['ProgramFiles(x86)'] || '', 'Microsoft VS Code', 'Code.exe')
         ]) ||
-        whereExe('code.exe') ||
-        firstExisting([
-          path.join(env.LOCALAPPDATA || '', 'Programs', 'Microsoft VS Code', 'bin', 'code.cmd')
-        ]);
+        whereExe('code.exe');
+      if (!exe) {
+        const cmd =
+          firstExisting([
+            path.join(env.LOCALAPPDATA || '', 'Programs', 'Microsoft VS Code', 'bin', 'code.cmd'),
+            path.join(env.ProgramFiles || '', 'Microsoft VS Code', 'bin', 'code.cmd'),
+            path.join(env['ProgramFiles(x86)'] || '', 'Microsoft VS Code', 'bin', 'code.cmd')
+          ]) ||
+          whereExe('code.cmd') ||
+          whereExe('code');
+        if (cmd) {
+          const underlying = path.resolve(path.dirname(cmd), '..', 'Code.exe');
+          if (firstExisting([underlying])) {
+            exe = underlying;
+          } else {
+            exe = cmd;
+          }
+        }
+      }
       if (!exe) throw new Error('VSCODE_NOT_FOUND');
-      if (exe.toLowerCase().endsWith('.cmd'))
+      if (exe.toLowerCase().endsWith('.cmd') || exe.toLowerCase().endsWith('.bat')) {
+        if (target && (!isSafeBrowserTarget(target) || /[&|<>()^%!]/.test(target))) {
+          throw new Error('GUI_TARGET_INVALID');
+        }
         return {
           file: 'cmd.exe',
           args: ['/d', '/s', '/c', '""' + exe + '"', ...(target ? [target] : [])],
           viaShell: true
         };
+      }
       return { file: exe, args: target ? [target] : [] };
     }
     case 'cursor': {
@@ -1041,12 +1061,33 @@ try {
         elseif ($app -eq 'explorer') { $p = Start-Process -FilePath 'explorer.exe' -ArgumentList @($target) -PassThru }
         elseif ($app -eq 'code') {
           $codeExe = @(
-            "$env:LOCALAPPDATA\Programs\Microsoft VS Code\bin\code.cmd",
             "$env:LOCALAPPDATA\Programs\Microsoft VS Code\Code.exe",
-            "$env:ProgramFiles\Microsoft VS Code\bin\code.cmd",
-            "$env:ProgramFiles\Microsoft VS Code\Code.exe"
+            "$env:ProgramFiles\Microsoft VS Code\Code.exe",
+            "$env:ProgramFiles (x86)\Microsoft VS Code\Code.exe"
           ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $codeExe) { $codeExe = (Get-Command code -ErrorAction SilentlyContinue).Source }
+          if (-not $codeExe) { $codeExe = (Get-Command code.exe -ErrorAction SilentlyContinue).Source }
+          if (-not $codeExe) {
+            $codeCmd = @(
+              "$env:LOCALAPPDATA\Programs\Microsoft VS Code\bin\code.cmd",
+              "$env:ProgramFiles\Microsoft VS Code\bin\code.cmd",
+              "$env:ProgramFiles (x86)\Microsoft VS Code\bin\code.cmd"
+            ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+            if (-not $codeCmd) {
+              $cmdFound = (Get-Command code -ErrorAction SilentlyContinue).Source
+              if ($cmdFound) {
+                if ($cmdFound -like '*.exe') { $codeExe = $cmdFound }
+                else { $codeCmd = $cmdFound }
+              }
+            }
+            if ($codeCmd) {
+              $underlying = Join-Path (Split-Path (Split-Path $codeCmd -Parent)) 'Code.exe'
+              if (Test-Path $underlying) { $codeExe = $underlying }
+              else {
+                if ($target -and ($target -match '[\s"''\x60&|<>^%!\x00-\x1f\x7f]')) { throw 'GUI_TARGET_INVALID' }
+                $codeExe = $codeCmd
+              }
+            }
+          }
           if (-not $codeExe) { throw 'VSCODE_NOT_FOUND' }
           $p = if ($target) { Start-Process -FilePath $codeExe -ArgumentList @($target) -PassThru } else { Start-Process -FilePath $codeExe -PassThru }
         }

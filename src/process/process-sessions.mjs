@@ -685,6 +685,7 @@ export function startSession(
   const session = {
     child,
     pid: child.pid || 0,
+    detached: process.platform !== 'win32',
     started_at: new Date(now).toISOString(),
     executable: resolved,
     args: [...args],
@@ -755,12 +756,14 @@ export function startSession(
     session.exitCode = code;
     session.exitSignal = signal;
     session.lastActivityMs = Date.now();
-    // The watchdog below must never fire after exit: on POSIX the child is
-    // a detached group leader, so a late kill(-pid) could SIGKILL an
-    // unrelated recycled process group.
+    // Only disarm killTimer if the entire process group is gone.
+    // If detached grandchildren survive in the group, keep killTimer armed
+    // so the watchdog continues to police surviving group members.
     if (session.killTimer) {
-      clearTimeout(session.killTimer);
-      session.killTimer = null;
+      if (!session.detached || process.platform === 'win32' || !isGroupAlive(session.pid)) {
+        clearTimeout(session.killTimer);
+        session.killTimer = null;
+      }
     }
     session.emitter?.emit('exit');
   });
@@ -769,7 +772,7 @@ export function startSession(
   });
   const timeout = setTimeout(() => {
     session.killTimer = null;
-    if (session.exited) return;
+    if (session.exited && !(session.detached && process.platform !== 'win32')) return;
     // P2-05: verified timeout kill (PID-reuse guard). Threads the session's
     // recorded identity; the pre-verify inside terminateSessionTreeAsync
     // fails closed (skipped-unverified, no signal) instead of blind SIGKILL.
@@ -882,6 +885,64 @@ function isPidAlive(pid, platform = process.platform) {
 /** @param {number} ms */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+export function isGroupAlive(pid) {
+  const id = Math.floor(Number(pid));
+  if (!Number.isInteger(id) || id < 2) return false;
+  try {
+    process.kill(-id, 0);
+    return true;
+  } catch (e) {
+    return /** @type {NodeJS.ErrnoException} */ (e)?.code !== 'ESRCH';
+  }
+}
+
+export async function verifyPgidIdentity(
+  pid,
+  startedAtIso,
+  { platform = process.platform, execFile = null } = {}
+) {
+  const id = Math.floor(Number(pid));
+  if (!Number.isInteger(id) || id < 2) return false;
+  const leaderVerdict = await verifyProcessStartTime(id, startedAtIso, { platform, execFile });
+  if (leaderVerdict === true) return true;
+  if (leaderVerdict === false) return false;
+  if (platform === 'linux') {
+    try {
+      const expected = Date.parse(String(startedAtIso || ''));
+      if (!Number.isFinite(expected)) return false;
+      const btime = Number(
+        fs
+          .readFileSync('/proc/stat', 'utf8')
+          .split('\n')
+          .find((l) => l.startsWith('btime'))
+          ?.split(/\s+/)[1]
+      );
+      if (!Number.isFinite(btime)) return false;
+      const ticksPerSec = 100;
+      const pids = fs.readdirSync('/proc').filter((p) => /^\d+$/.test(p));
+      for (const p of pids) {
+        try {
+          const s = fs.readFileSync(`/proc/${p}/stat`, 'utf8');
+          const afterComm = s.slice(s.lastIndexOf(')') + 1).trim().split(/\s+/);
+          const pgrp = Number(afterComm[2]);
+          if (pgrp === id) {
+            const ticks = Number(afterComm[19]);
+            if (Number.isFinite(ticks)) {
+              const actualMs = (btime + ticks / ticksPerSec) * 1000;
+              if (Math.abs(actualMs - expected) <= SWEEP_VERIFY_TOLERANCE_MS) {
+                return true;
+              }
+            }
+          }
+        } catch {}
+      }
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
 /**
  * Graceful termination with bounded escalation (SYN-PROC-002): signal gently,
  * wait up to graceMs polling liveness, then force. Never throws; reports how
@@ -914,12 +975,19 @@ export async function terminateSessionTreeAsync(
   if (expectedStartedAt != null) {
     let pre = null;
     try {
-      pre = await verifyProcessStartTime(pid, String(expectedStartedAt), {
-        platform,
-        execFile,
-        expectedPath,
-        expectedCommandLine
-      });
+      if (isPidAlive(pid, platform)) {
+        pre = await verifyProcessStartTime(pid, String(expectedStartedAt), {
+          platform,
+          execFile,
+          expectedPath,
+          expectedCommandLine
+        });
+      } else if (platform !== 'win32' && isGroupAlive(pid)) {
+        pre = await verifyPgidIdentity(pid, String(expectedStartedAt), {
+          platform,
+          execFile
+        });
+      }
     } catch {
       pre = null;
     }
@@ -990,26 +1058,39 @@ export async function terminateSessionTreeAsync(
       }
     }
   }
+  const isAliveOrGroup = () => {
+    if (isPidAlive(pid, platform)) return true;
+    if (platform !== 'win32' && isGroupAlive(pid)) return true;
+    return false;
+  };
+
   if (!force && grace > 0) {
     const deadline = Date.now() + grace;
     while (Date.now() < deadline) {
-      if (!isPidAlive(pid, platform)) return { signaled: true, signal: gentle, graceful: true };
+      if (!isAliveOrGroup()) return { signaled: true, signal: gentle, graceful: true };
       await sleep(100);
     }
   }
-  if (!force && isPidAlive(pid, platform)) {
+  if (!force && isAliveOrGroup()) {
     // V-32.12: same PID-reuse guard as the win32 path above. The grace
     // window gives the OS time to recycle the PID; escalating to SIGKILL
     // without re-verifying start time could kill an innocent process.
     if (expectedStartedAt != null) {
       let verdict = null;
       try {
-        verdict = await verifyProcessStartTime(pid, String(expectedStartedAt), {
-          platform,
-          execFile,
-          expectedPath,
-          expectedCommandLine
-        });
+        if (isPidAlive(pid, platform)) {
+          verdict = await verifyProcessStartTime(pid, String(expectedStartedAt), {
+            platform,
+            execFile,
+            expectedPath,
+            expectedCommandLine
+          });
+        } else if (platform !== 'win32' && isGroupAlive(pid)) {
+          verdict = await verifyPgidIdentity(pid, String(expectedStartedAt), {
+            platform,
+            execFile
+          });
+        }
       } catch {
         verdict = null;
       }

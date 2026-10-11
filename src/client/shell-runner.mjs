@@ -968,7 +968,8 @@ export async function executeShellJob(job, options = {}) {
       const invocation = shellInvocation(command);
       shellExe = invocation.file;
       shellArgList = Array.isArray(invocation.args) ? [...invocation.args] : [];
-      child = spawn(invocation.file, invocation.args, {
+      const spawnFn = options.spawn || spawn;
+      child = spawnFn(invocation.file, invocation.args, {
         cwd,
         env: shellEnvironment(),
         detached: shellChildDetached(),
@@ -1043,6 +1044,18 @@ export async function executeShellJob(job, options = {}) {
       try {
         killTimer.unref?.();
       } catch {}
+      try {
+        child.stdout?.destroy();
+      } catch {}
+      try {
+        child.stderr?.destroy();
+      } catch {}
+      const fallbackTimer = setTimeout(() => {
+        finish(null, 'SIGTERM', { message: 'timed_out' });
+      }, 500);
+      try {
+        fallbackTimer.unref?.();
+      } catch {}
     }, timeoutSeconds * 1000);
     // Leak-free watchdog: a 3600s pending timer must not pin the agent
     // event loop by itself (the ws session owns liveness, not the timer).
@@ -1064,7 +1077,7 @@ export async function executeShellJob(job, options = {}) {
       const stdoutTruncated = stdoutAcc.truncated;
       const stderrTruncated = stderrAcc.truncated;
       const duration_ms = Date.now() - started;
-      if (spawnError) {
+      if (spawnError && (!timedOut || spawnError?.message !== 'timed_out')) {
         resolve({
           status: 'failed',
           exit_code: null,
@@ -1155,6 +1168,18 @@ export async function executeShellJob(job, options = {}) {
           try {
             killTimer = setTimeout(() => killShellTreeVerified(true), 1500);
             killTimer.unref?.();
+          } catch {}
+          try {
+            child.stdout?.destroy();
+          } catch {}
+          try {
+            child.stderr?.destroy();
+          } catch {}
+          const fallbackTimer = setTimeout(() => {
+            finish(null, 'SIGTERM', { message: 'cancelled' });
+          }, 500);
+          try {
+            fallbackTimer.unref?.();
           } catch {}
         });
       }

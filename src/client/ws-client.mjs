@@ -228,6 +228,20 @@ export class ClientWebSocket extends EventEmitter {
   }
 }
 /**
+ * @param {string} hostname
+ */
+function isLoopbackHostname(hostname) {
+  const h = String(hostname || '').toLowerCase();
+  return (
+    h === 'localhost' ||
+    h === '127.0.0.1' ||
+    h === '::1' ||
+    h === '[::1]' ||
+    /^127(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/.test(h)
+  );
+}
+
+/**
  * @param {string} serverUrl
  * @param {object} [options]
  * @param {string} [options.path]
@@ -239,8 +253,18 @@ export function connectWebSocket(
   serverUrl,
   { path = '/agent/connect', token = '', deviceProof = '', timeoutMs = 8000 } = {}
 ) {
-  const base = new URL(serverUrl),
-    secure = base.protocol === 'https:',
+  const base = new URL(serverUrl);
+  if (base.protocol === 'https:') {
+    // production / secure tunnel
+  } else if (base.protocol === 'http:') {
+    if (!isLoopbackHostname(base.hostname)) {
+      throw new Error('WS_HTTPS_REQUIRED');
+    }
+  } else {
+    throw new Error('WS_SCHEME_UNSUPPORTED');
+  }
+
+  const secure = base.protocol === 'https:',
     mod = secure ? https : http,
     key = crypto.randomBytes(16).toString('base64');
   /** @type {Record<string, string>} */

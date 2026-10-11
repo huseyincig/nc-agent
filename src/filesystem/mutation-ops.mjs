@@ -5,7 +5,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { policyExtraRoots } from '../policy/host-policy.mjs';
 import { isSensitivePath } from './sensitive-paths.mjs';
-import { MutationError, authorizeMutationPath, err, forbidAgentTreeWrite, lstatOrNull, mutationTargets, normCase, normalizeMutationPath, realAllowedRoots } from './path-auth.mjs';
+import { MutationError, authorizeMutationPath, denySensitivePath, err, forbidAgentTreeWrite, isNoEnt, lstatOrNull, mutationTargets, normCase, normalizeMutationPath, realAllowedRoots, within } from './path-auth.mjs';
 import { normalizeServiceMode } from '../client/shell-runner.mjs';
 
 
@@ -92,9 +92,14 @@ async function openNoFollow(target, numericFlags, fallbackFlag, { fsApi = fs } =
 /**
  * @param {string} file @param {typeof import('node:fs/promises')} fsApi
  */
-async function shaFile(file, fsApi) {
+export async function shaFile(file, fsApi) {
   const h = crypto.createHash('sha256');
-  const handle = await fsApi.open(file, 'r');
+  const handle = await openNoFollow(
+    file,
+    fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0),
+    'r',
+    { fsApi }
+  );
   try {
     const buffer = Buffer.allocUnsafe(64 * 1024);
     let position = 0;
@@ -108,6 +113,70 @@ async function shaFile(file, fsApi) {
   } finally {
     await handle.close();
   }
+}
+
+/**
+ * Verify that the parent directory has not drifted, been swapped to a symlink,
+ * or moved outside authorized roots/agent bans since authorization.
+ * Reusable across file mutations to mitigate parent-directory TOCTOU races.
+ * @param {string} parent lexical parent directory
+ * @param {string} validatedParentReal canonical realpath established at authorization
+ * @param {object} [options]
+ * @param {typeof import('node:fs/promises')} [options.fsApi]
+ * @param {any} [options.pathApi]
+ * @param {boolean} [options.allowAll]
+ * @param {Array<string>} [options.realRoots]
+ * @param {Array<string>} [options.roots]
+ * @param {{tool?: string, appRoot?: string|null, workspace?: string|null, pathApi?: any}|null} [options.treeBan]
+ * @param {string} [options.target]
+ * @param {string} [options.tool]
+ */
+export async function verifyParentStable(parent, validatedParentReal, options = {}) {
+  const {
+    fsApi = fs,
+    pathApi = path,
+    allowAll = false,
+    realRoots = options.roots || [],
+    treeBan = null,
+    target = parent,
+    tool = 'mutation'
+  } = options;
+  const parentStatNow = await lstatOrNull(parent, fsApi);
+  if (!parentStatNow || parentStatNow.isSymbolicLink() || !parentStatNow.isDirectory()) {
+    err('PATH_NOT_ALLOWED', { path: target, configured_roots: [...realRoots] });
+  }
+  let currentParentReal;
+  try {
+    currentParentReal = await fsApi.realpath(parent);
+  } catch {
+    err('PATH_NOT_ALLOWED', { path: target, configured_roots: [...realRoots] });
+  }
+  if (currentParentReal !== validatedParentReal) {
+    err('PATH_NOT_ALLOWED', {
+      path: target,
+      resolved_path: currentParentReal,
+      configured_roots: [...realRoots]
+    });
+  }
+  denySensitivePath(currentParentReal, pathApi);
+  if (
+    allowAll !== true &&
+    !realRoots.some((root) => within(currentParentReal, root, pathApi))
+  ) {
+    err('PATH_NOT_ALLOWED', {
+      path: target,
+      resolved_path: currentParentReal,
+      configured_roots: [...realRoots]
+    });
+  }
+  if (treeBan && treeBan.appRoot) {
+    forbidAgentTreeWrite(treeBan.tool || tool, [target, currentParentReal], {
+      appRoot: treeBan.appRoot,
+      workspace: treeBan.workspace ?? null,
+      pathApi
+    });
+  }
+  return currentParentReal;
 }
 /**
  * Best-effort durability sync for a just-written sibling temp file: the bytes
@@ -346,9 +415,33 @@ export async function fileWriteMutation(
         if (Number(appendStat.nlink || 1) > 1) err('PATH_HARDLINK_NOT_ALLOWED_FOR_APPEND');
         if (expected && (await shaFile(normalized, fsApi)) !== expected)
           err('FILE_SHA256_MISMATCH');
-        await fsApi.appendFile(normalized, /** @type {string} */ (payload.content), {
-          encoding: 'utf8'
+        const appendParent = pathApi.dirname(normalized);
+        let validatedAppendParentReal;
+        try {
+          validatedAppendParentReal = await fsApi.realpath(appendParent);
+        } catch {
+          err('PATH_NOT_ALLOWED', { path: normalized, configured_roots: [...appendLeaf.real_roots] });
+        }
+        await verifyParentStable(appendParent, validatedAppendParentReal, {
+          ...options,
+          realRoots: appendLeaf.real_roots,
+          target: normalized,
+          tool: 'file_write'
         });
+        const C = fsConstants;
+        const appendH = await openNoFollow(
+          normalized,
+          C.O_WRONLY | C.O_APPEND | (C.O_NOFOLLOW || 0),
+          'a',
+          { fsApi }
+        );
+        try {
+          const buf = Buffer.from(/** @type {string} */ (payload.content), 'utf8');
+          await appendH.write(buf, 0, buf.length, null);
+          if (typeof appendH.sync === 'function') await appendH.sync();
+        } finally {
+          await appendH.close();
+        }
       } else {
         const tmp = pathApi.join(
           pathApi.dirname(normalized),
@@ -369,6 +462,19 @@ export async function fileWriteMutation(
           if (platform !== 'win32') await fsApi.chmod(tmp, st.mode & 0o7777);
           if (expected && (await shaFile(normalized, fsApi)) !== expected)
             err('FILE_SHA256_MISMATCH');
+          const writeParent = pathApi.dirname(normalized);
+          let validatedWriteParentReal;
+          try {
+            validatedWriteParentReal = await fsApi.realpath(writeParent);
+          } catch {
+            err('PATH_NOT_ALLOWED', { path: normalized, configured_roots: [...leaf.real_roots] });
+          }
+          await verifyParentStable(writeParent, validatedWriteParentReal, {
+            ...options,
+            realRoots: leaf.real_roots,
+            target: normalized,
+            tool: 'file_write'
+          });
           await fsApi.rename(tmp, normalized);
         } finally {
           try {
@@ -486,6 +592,32 @@ export async function fileMoveMutation(payload, { roots, allowAll = false, fsApi
     if (dstNow && !overwrite) err('DESTINATION_EXISTS');
     if (dstNow && (dstNow.isDirectory() || (!dstNow.isFile() && !dstNow.isSymbolicLink())))
       err('PATH_TYPE_NOT_SUPPORTED');
+    const srcParent = pathApi.dirname(source);
+    let validatedSrcParentReal;
+    try {
+      validatedSrcParentReal = await fsApi.realpath(srcParent);
+    } catch {
+      err('PATH_NOT_ALLOWED', { path: source, configured_roots: [...srcLeafNow.real_roots] });
+    }
+    const dstParent = pathApi.dirname(destination);
+    let validatedDstParentReal;
+    try {
+      validatedDstParentReal = await fsApi.realpath(dstParent);
+    } catch {
+      err('PATH_NOT_ALLOWED', { path: destination, configured_roots: [...dstLeafNow.real_roots] });
+    }
+    await verifyParentStable(srcParent, validatedSrcParentReal, {
+      ...sourceOptions,
+      realRoots: srcLeafNow.real_roots,
+      target: source,
+      tool: 'file_move'
+    });
+    await verifyParentStable(dstParent, validatedDstParentReal, {
+      ...sourceOptions,
+      realRoots: dstLeafNow.real_roots,
+      target: destination,
+      tool: 'file_move'
+    });
     try {
       await fsApi.rename(source, destination);
     } catch (e) {
@@ -495,6 +627,71 @@ export async function fileMoveMutation(payload, { roots, allowAll = false, fsApi
     }
     return { source, destination, overwritten: Boolean(dstNow) };
   });
+}
+
+/**
+ * Authorize source path for fileCopyMutation.
+ * Enforces read authority (RA-03-06):
+ * 1. Normalized and resolved paths checked against sensitive denylist (SEC-001)
+ * 2. Real source resolved with fsApi.realpath and checked for root containment
+ * 3. Real file stat enforced (regular file, <= MAX_WRITE_BYTES)
+ * 4. Symlink leaf rejected with PATH_TYPE_NOT_SUPPORTED: copy of a link is unusual,
+ *    dereferencing copies content instead of the link, and rename-based move covers link preservation.
+ * @param {string} source
+ * @param {object} options
+ * @param {Array<string>} [options.roots]
+ * @param {boolean} [options.allowAll]
+ * @param {typeof import('node:fs/promises')} options.fsApi
+ * @param {any} options.pathApi
+ * @param {{tool?: string, appRoot?: string|null, workspace?: string|null, pathApi?: any}|null} [options.treeBan]
+ */
+async function authorizeCopySource(source, options) {
+  const { roots, allowAll = false, fsApi = fs, pathApi = path, treeBan = null } = options;
+  const leafOpts = { ...options, fsApi, pathApi };
+  denySensitivePath(source, pathApi);
+  await forbidConfiguredRootTarget(source, leafOpts);
+  const srcAuth = await authorizeLeafParent(source, leafOpts);
+  rootTargetForbidden(source, srcAuth.real_roots, pathApi);
+  const srcStat = await lstatOrNull(source, fsApi);
+  if (!srcStat) err('FILE_NOT_FOUND');
+  if (srcStat.isDirectory() || (!srcStat.isFile() && !srcStat.isSymbolicLink()))
+    err('PATH_TYPE_NOT_SUPPORTED');
+
+  let realSource;
+  try {
+    realSource = await fsApi.realpath(source);
+  } catch (e) {
+    if (isNoEnt(e)) err('FILE_NOT_FOUND');
+    throw e;
+  }
+  denySensitivePath(realSource, pathApi);
+  const realRoots = srcAuth.real_roots;
+  if (allowAll !== true && !realRoots.some((r) => within(realSource, r, pathApi))) {
+    err('PATH_NOT_ALLOWED', {
+      path: source,
+      ...(realSource !== source ? { resolved_path: realSource } : {}),
+      configured_roots: [...realRoots]
+    });
+  }
+  if (treeBan && treeBan.appRoot) {
+    forbidAgentTreeWrite(treeBan.tool || 'file_copy', [source, realSource], {
+      appRoot: treeBan.appRoot,
+      workspace: treeBan.workspace ?? null,
+      pathApi
+    });
+  }
+  let realStat;
+  try {
+    realStat = await fsApi.stat(source);
+  } catch (e) {
+    if (isNoEnt(e)) err('FILE_NOT_FOUND');
+    throw e;
+  }
+  if (realStat.isDirectory() || !realStat.isFile()) err('PATH_TYPE_NOT_SUPPORTED');
+  if (realStat.size > MAX_WRITE_BYTES) err('CONTENT_TOO_LARGE');
+  if (srcStat.isSymbolicLink()) err('PATH_TYPE_NOT_SUPPORTED');
+
+  return { srcStat, realStat, realSource, realRoots };
 }
 
 /**
@@ -520,14 +717,7 @@ export async function fileCopyMutation(payload, { roots, allowAll = false, fsApi
   if (normCase(source, pathApi) === normCase(destination, pathApi))
     err('SOURCE_EQUALS_DESTINATION');
   const sourceOptions = { roots, allowAll, fsApi, pathApi, treeBan };
-  await forbidConfiguredRootTarget(source, sourceOptions);
-  const srcAuth = await authorizeLeafParent(source, sourceOptions);
-  rootTargetForbidden(source, srcAuth.real_roots, pathApi);
-  const srcStat = await lstatOrNull(source, fsApi);
-  if (!srcStat) err('FILE_NOT_FOUND');
-  if (srcStat.isDirectory() || (!srcStat.isFile() && !srcStat.isSymbolicLink()))
-    err('PATH_TYPE_NOT_SUPPORTED');
-  if (srcStat.size > MAX_WRITE_BYTES) err('CONTENT_TOO_LARGE');
+  await authorizeCopySource(source, sourceOptions);
 
   await forbidConfiguredRootTarget(destination, sourceOptions);
   const dstAuth = await authorizeLeafParent(destination, sourceOptions);
@@ -544,30 +734,52 @@ export async function fileCopyMutation(payload, { roots, allowAll = false, fsApi
   if (dstStat && dstStat.isSymbolicLink()) err('PATH_TYPE_NOT_SUPPORTED');
   if (dstStat && (dstStat.isDirectory() || (!dstStat.isFile() && !dstStat.isSymbolicLink())))
     err('PATH_TYPE_NOT_SUPPORTED');
+  if (dstStat && Number(dstStat.nlink || 1) > 1) err('TARGET_HARDLINKED', { path: destination, nlink: dstStat.nlink });
 
   return serializedMany([normCase(source, pathApi), normCase(destination, pathApi)], async () => {
-    await forbidConfiguredRootTarget(source, sourceOptions);
-    const srcLeafNow = await authorizeLeafParent(source, sourceOptions);
-    rootTargetForbidden(source, srcLeafNow.real_roots, pathApi);
+    const { realStat: srcRealStat } = await authorizeCopySource(source, sourceOptions);
     await forbidConfiguredRootTarget(destination, sourceOptions);
     const dstLeafNow = await authorizeLeafParent(destination, sourceOptions);
     rootTargetForbidden(destination, dstLeafNow.real_roots, pathApi);
-    const srcNow = await lstatOrNull(source, fsApi);
-    if (!srcNow) err('FILE_NOT_FOUND');
-    if (srcNow.isDirectory() || (!srcNow.isFile() && !srcNow.isSymbolicLink()))
-      err('PATH_TYPE_NOT_SUPPORTED');
-    if (srcNow.size > MAX_WRITE_BYTES) err('CONTENT_TOO_LARGE');
     const dstNow = await lstatOrNull(destination, fsApi);
     if (dstNow && !overwrite) err('DESTINATION_EXISTS');
     if (dstNow && dstNow.isSymbolicLink()) err('PATH_TYPE_NOT_SUPPORTED');
     if (dstNow && (dstNow.isDirectory() || (!dstNow.isFile() && !dstNow.isSymbolicLink())))
       err('PATH_TYPE_NOT_SUPPORTED');
+    if (dstNow && Number(dstNow.nlink || 1) > 1) err('TARGET_HARDLINKED', { path: destination, nlink: dstNow.nlink });
+    const srcLeafNow = await authorizeLeafParent(source, sourceOptions);
+    const srcParent = pathApi.dirname(source);
+    let validatedSrcParentReal;
+    try {
+      validatedSrcParentReal = await fsApi.realpath(srcParent);
+    } catch {
+      err('PATH_NOT_ALLOWED', { path: source, configured_roots: [...srcLeafNow.real_roots] });
+    }
+    const dstParent = pathApi.dirname(destination);
+    let validatedDstParentReal;
+    try {
+      validatedDstParentReal = await fsApi.realpath(dstParent);
+    } catch {
+      err('PATH_NOT_ALLOWED', { path: destination, configured_roots: [...dstLeafNow.real_roots] });
+    }
+    await verifyParentStable(srcParent, validatedSrcParentReal, {
+      ...sourceOptions,
+      realRoots: srcLeafNow.real_roots,
+      target: source,
+      tool: 'file_copy'
+    });
+    await verifyParentStable(dstParent, validatedDstParentReal, {
+      ...sourceOptions,
+      realRoots: dstLeafNow.real_roots,
+      target: destination,
+      tool: 'file_copy'
+    });
     await fsApi.copyFile(source, destination);
     const after = await lstatOrNull(destination, fsApi);
     return {
       source,
       destination,
-      bytes: after ? after.size : srcNow.size,
+      bytes: after ? after.size : srcRealStat.size,
       overwritten: Boolean(dstNow)
     };
   });
@@ -619,6 +831,16 @@ export async function transferWriteMutation(payload, { roots, allowAll = false, 
   if (!parentStat || !parentStat.isDirectory() || parentStat.isSymbolicLink())
     err('PARENT_NOT_FOUND');
   await authorizeMutationPath(parent, options);
+  const preExisting = await lstatOrNull(target, fsApi);
+  if (offset === 0) {
+    if (preExisting && preExisting.isSymbolicLink()) err('PATH_TYPE_NOT_SUPPORTED');
+    if (preExisting && (preExisting.isDirectory() || (!preExisting.isFile() && !preExisting.isSymbolicLink())))
+      err('PATH_TYPE_NOT_SUPPORTED');
+    if (preExisting && preExisting.isFile() && !overwrite) err('DESTINATION_EXISTS');
+    if (preExisting && Number(preExisting.nlink || 1) > 1) err('TARGET_HARDLINKED', { path: target, nlink: preExisting.nlink });
+  } else {
+    if (preExisting && Number(preExisting.nlink || 1) > 1) err('TARGET_HARDLINKED', { path: target, nlink: preExisting.nlink });
+  }
   return serialized(normCase(target, pathApi), async () => {
     await forbidConfiguredRootTarget(target, options);
     const leafNow = await authorizeLeafParent(target, options);
@@ -631,10 +853,25 @@ export async function transferWriteMutation(payload, { roots, allowAll = false, 
       if (existing && (existing.isDirectory() || (!existing.isFile() && !existing.isSymbolicLink())))
         err('PATH_TYPE_NOT_SUPPORTED');
       if (existing && existing.isFile() && !overwrite) err('DESTINATION_EXISTS');
+      if (existing && Number(existing.nlink || 1) > 1) err('TARGET_HARDLINKED', { path: target, nlink: existing.nlink });
     } else {
       if (!existing || !existing.isFile()) err('TRANSFER_OFFSET_MISMATCH');
       if (existing.size !== offset) err('TRANSFER_OFFSET_MISMATCH');
+      if (Number(existing.nlink || 1) > 1) err('TARGET_HARDLINKED', { path: target, nlink: existing.nlink });
     }
+    const targetParent = pathApi.dirname(target);
+    let validatedTargetParentReal;
+    try {
+      validatedTargetParentReal = await fsApi.realpath(targetParent);
+    } catch {
+      err('PATH_NOT_ALLOWED', { path: target, configured_roots: [...leafNow.real_roots] });
+    }
+    await verifyParentStable(targetParent, validatedTargetParentReal, {
+      ...options,
+      realRoots: leafNow.real_roots,
+      target,
+      tool: 'transfer_write'
+    });
     // V-32.8: numeric flags with O_NOFOLLOW close the lstat->open TOCTOU:
     // a symlink planted after the gate above fails with ELOOP (mapped to
     // PATH_TYPE_NOT_SUPPORTED) instead of truncating outside the tree.
@@ -671,6 +908,12 @@ export async function transferWriteMutation(payload, { roots, allowAll = false, 
     const size = after ? after.size : offset + chunk.length;
     let sha256 = null;
     if (finalize) {
+      await verifyParentStable(targetParent, validatedTargetParentReal, {
+        ...options,
+        realRoots: leafNow.real_roots,
+        target,
+        tool: 'transfer_write'
+      });
       const hash = crypto.createHash('sha256');
       const rh = await openNoFollow(target, C.O_RDONLY | (C.O_NOFOLLOW || 0), 'r', { fsApi });
       try {
@@ -706,10 +949,17 @@ export async function transferWriteMutation(payload, { roots, allowAll = false, 
  * @param {string} [options.platform]
  * @param {{tool?: string, appRoot?: string|null, workspace?: string|null, pathApi?: any}|null} [options.treeBan]
  */
-export async function fileDeleteMutation(payload, { roots, allowAll = false, fsApi = fs, pathApi = path, treeBan = null } = {}) {
+export async function fileDeleteMutation(
+  payload,
+  { roots, allowAll = false, fsApi = fs, pathApi = path, treeBan = null, cwd = null, homedir = null } = {}
+) {
   const recursive = optionalBoolean(payload, 'recursive', 'INVALID_RECURSIVE');
-  const target = normalizeMutationPath(/** @type {string} */ (payload?.path), { pathApi });
-  const options = { roots, allowAll, fsApi, pathApi, treeBan };
+  const target = normalizeMutationPath(/** @type {string} */ (payload?.path), {
+    pathApi,
+    cwd,
+    homedir
+  });
+  const options = { roots, allowAll, fsApi, pathApi, treeBan, cwd, homedir };
   await forbidConfiguredRootTarget(target, options);
   const auth = await authorizeLeafParent(target, options);
   rootTargetForbidden(target, auth.real_roots, pathApi);
@@ -719,12 +969,40 @@ export async function fileDeleteMutation(payload, { roots, allowAll = false, fsA
     rootTargetForbidden(target, leafNow.real_roots, pathApi);
     const st = await lstatOrNull(target, fsApi);
     if (!st) err('FILE_NOT_FOUND');
+
+    const parent = leafNow.parent;
+    const parentStatBefore = await lstatOrNull(parent, fsApi);
+    if (!parentStatBefore || parentStatBefore.isSymbolicLink() || !parentStatBefore.isDirectory()) {
+      err('PATH_NOT_ALLOWED', { path: target, configured_roots: [...leafNow.real_roots] });
+    }
+    let validatedParentReal;
+    try {
+      validatedParentReal = await fsApi.realpath(parent);
+    } catch {
+      err('PATH_NOT_ALLOWED', { path: target, configured_roots: [...leafNow.real_roots] });
+    }
+
+    const verifyParentBeforeRm = async () => {
+      await verifyParentStable(parent, validatedParentReal, {
+        ...options,
+        realRoots: leafNow.real_roots,
+        target,
+        tool: 'file_delete'
+      });
+    };
+
     if (st.isDirectory() && !st.isSymbolicLink()) {
       if (!recursive) err('DIRECTORY_RECURSIVE_REQUIRED');
+      await verifyParentBeforeRm();
+      const targetStatNow = await lstatOrNull(target, fsApi);
+      if (!targetStatNow || targetStatNow.isSymbolicLink() || !targetStatNow.isDirectory()) {
+        err('PATH_TYPE_NOT_SUPPORTED');
+      }
       await fsApi.rm(target, { recursive: true, force: false });
       return { path: target, type: 'directory', recursive: true, deleted: true };
     }
     if (!st.isFile() && !st.isSymbolicLink()) err('PATH_TYPE_NOT_SUPPORTED');
+    await verifyParentBeforeRm();
     await fsApi.unlink(target);
     return {
       path: target,
@@ -814,6 +1092,17 @@ export function normalizeMutationError(error, context = {}) {
       denied.reason =
         `Path${where} is outside the allowlisted filesystem roots.` +
         (hint ? ` ${hint}` : '');
+    }
+    if (error.code === 'TARGET_HARDLINKED') {
+      const where =
+        effectiveDetails && typeof effectiveDetails.path === 'string'
+          ? ` '${effectiveDetails.path}'`
+          : '';
+      denied.reason =
+        `Destination${where} is a hardlink alias (nlink > 1) — refusing to overwrite shared inode.`;
+    }
+    if (error.code === 'PATH_DENIED_SENSITIVE') {
+      denied.reason = 'Path is denied because it refers to protected credentials or system files.';
     }
     if (error.code === 'EXPECTED_TEXT_AMBIGUOUS' && effectiveDetails) {
       const matches =

@@ -7,7 +7,10 @@ test('package version matches client VERSION', async () => {
   const { compareAgentVersions } = await import('../src/updater/updater.mjs');
   assert.equal(typeof compareAgentVersions('0.4.61', '0.4.60'), 'number');
   assert.ok(compareAgentVersions('0.4.61', '0.4.60') > 0);
-  assert.equal(pkg.version, '0.17.24');
+  const clientSrc = fs.readFileSync(new URL('../src/client/client.mjs', import.meta.url), 'utf8');
+  const m = clientSrc.match(/const VERSION = '([^']+)';/);
+  assert.ok(m, 'VERSION definition found in client.mjs');
+  assert.equal(pkg.version, m[1]);
 });
 
 test('policy and contract modules load', async () => {

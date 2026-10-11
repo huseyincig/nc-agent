@@ -196,6 +196,42 @@ export async function validateCdpEndpoint(endpoint, network = {}) {
 export const MAX_EVALUATE_EXPRESSION_CHARS = 65536;
 
 /**
+ * Checks whether a semver version string is >= minimum (e.g. 1.48.0).
+ * @param {string} version
+ * @param {string} [minVersion]
+ * @returns {boolean}
+ */
+export function isPlaywrightVersionAtLeast(version, minVersion = '1.48.0') {
+  if (!version || typeof version !== 'string') return false;
+  const clean = version.trim().replace(/^v/, '');
+  const [vMajor, vMinor = 0, vPatch = 0] = clean.split('.').map((p) => parseInt(p, 10));
+  const [mMajor, mMinor = 0, mPatch = 0] = minVersion.split('.').map((p) => parseInt(p, 10));
+  if (Number.isNaN(vMajor) || Number.isNaN(mMajor)) return false;
+  if (vMajor > mMajor) return true;
+  if (vMajor < mMajor) return false;
+  if (vMinor > mMinor) return true;
+  if (vMinor < mMinor) return false;
+  return vPatch >= mPatch;
+}
+
+/**
+ * Ensures the Playwright runtime supports serviceWorkers: 'block' (supported since 1.48.0).
+ * Fails closed if unsupported.
+ * @param {string|null|undefined} version
+ */
+export function assertServiceWorkersBlockSupported(version) {
+  const v = String(version || '').trim();
+  if (!v || !isPlaywrightVersionAtLeast(v, '1.48.0')) {
+    throw Object.assign(
+      new Error(
+        `BROWSER_SERVICE_WORKERS_BLOCK_UNSUPPORTED: Playwright ${v || 'unknown'} does not support serviceWorkers: 'block' (requires >= 1.48.0)`
+      ),
+      { code: 'BROWSER_SERVICE_WORKERS_BLOCK_UNSUPPORTED' }
+    );
+  }
+}
+
+/**
  * Intercept and validate all network requests at BrowserContext or Page level
  * to prevent SSRF and redirect-based SSRF (NC-02).
  *
@@ -208,60 +244,108 @@ export const MAX_EVALUATE_EXPRESSION_CHARS = 65536;
 export async function installContextEgressFilter(context, sessionOrPolicy) {
   if (!context || typeof context.route !== 'function') return;
   if (context._egressFilterInstalled) return;
-  context._egressFilterInstalled = true;
 
-  try {
-    await context.route('**/*', async (route, request) => {
-      try {
-        const rawUrl =
-          typeof request.url === 'function' ? request.url() : String(request.url || '');
-        if (rawUrl.startsWith('about:')) {
-          return await route.continue().catch(() => {});
-        }
-        const policyHolder = sessionOrPolicy?.policy || sessionOrPolicy || {};
-        const net = policyHolder.network || policyHolder;
-        const allowPrivateNetwork =
-          net.allowPrivateNetwork === true || net.allow_private_networks === true;
-        const allowLoopback =
-          net.allowLoopback === true || net.allow_loopback === true;
-        const allowedHosts = Array.isArray(net.allowedHosts)
-          ? net.allowedHosts
-          : Array.isArray(net.allowed_hosts)
-            ? net.allowed_hosts
-            : Array.isArray(net.allowlist)
-              ? net.allowlist
-              : [];
-        const blockedHosts = Array.isArray(net.blockedHosts)
-          ? net.blockedHosts
-          : Array.isArray(net.blocked_hosts)
-            ? net.blocked_hosts
-            : Array.isArray(net.denylist)
-              ? net.denylist
-              : [];
-        const resolve =
-          typeof net.resolve === 'function'
-            ? net.resolve
-            : async (hostname) => {
-                const records = await dns.lookup(hostname, { all: true, verbatim: true });
-                return records.map((r) => r.address);
-              };
+  const getPolicyOpts = () => {
+    const policyHolder = sessionOrPolicy?.policy || sessionOrPolicy || {};
+    const net = policyHolder.network || policyHolder;
+    const allowPrivateNetwork =
+      net.allowPrivateNetwork === true || net.allow_private_networks === true;
+    const allowLoopback = net.allowLoopback === true || net.allow_loopback === true;
+    const allowedHosts = Array.isArray(net.allowedHosts)
+      ? net.allowedHosts
+      : Array.isArray(net.allowed_hosts)
+        ? net.allowed_hosts
+        : Array.isArray(net.allowlist)
+          ? net.allowlist
+          : [];
+    const blockedHosts = Array.isArray(net.blockedHosts)
+      ? net.blockedHosts
+      : Array.isArray(net.blocked_hosts)
+        ? net.blocked_hosts
+        : Array.isArray(net.denylist)
+          ? net.denylist
+          : [];
+    const resolve =
+      typeof net.resolve === 'function'
+        ? net.resolve
+        : async (hostname) => {
+            const records = await dns.lookup(hostname, { all: true, verbatim: true });
+            return records.map((r) => r.address);
+          };
+    return {
+      allowPrivateNetwork,
+      allowLoopback,
+      allowedHosts,
+      blockedHosts,
+      resolve
+    };
+  };
 
-        const validation = await validateEgressUrl(rawUrl, {
-          allowPrivateNetwork,
-          allowLoopback,
-          allowedHosts,
-          blockedHosts,
-          resolve
-        });
-        if (!validation.ok) {
-          return await route.abort('accessdenied').catch(() => {});
-        }
+  await context.route('**/*', async (route, request) => {
+    try {
+      const rawUrl = typeof request.url === 'function' ? request.url() : String(request.url || '');
+      if (rawUrl.startsWith('about:')) {
         return await route.continue().catch(() => {});
-      } catch {
+      }
+      const opts = getPolicyOpts();
+      const validation = await validateEgressUrl(rawUrl, opts);
+      if (!validation.ok) {
         return await route.abort('accessdenied').catch(() => {});
       }
+      // RA-02-07 Residual Risk Note (DNS Rebinding Window):
+      // validateEgressUrl resolves the hostname via Node dns.lookup and confirms the IP is public/allowed.
+      // However, route.continue() allows Chromium's network service to connect, which performs its own DNS lookup.
+      // If a malicious authoritative DNS server uses TTL=0 and rebinds between Node's check and Chromium's connection,
+      // Chromium could connect to a private/loopback IP.
+      // Investigation proved no safe toolchain mechanism exists to pin Chromium's socket to Node's validated IP:
+      // - route.fulfill with Node fetch breaks TLS/SNI, cookies, HTTP/2, streaming, and navigation lifecycles.
+      // - Chromium launch flag --host-resolver-rules is static and cannot handle dynamic session URLs.
+      // - CDP Fetch.continueRequest has no IP override parameter.
+      // This residual TOCTOU risk remains tracked until native socket-level pinning is supported.
+      return await route.continue().catch(() => {});
+    } catch {
+      return await route.abort('accessdenied').catch(() => {});
+    }
+  });
+
+  // RA-02-08: Intercept WebSocket connections when routeWebSocket is exposed by the context.
+  // When available (Playwright >= 1.48), enforce the same egress security policy (blocking
+  // loopback, metadata, private IPs, denied hosts, and unlisted hosts) with the same semantics as HTTP.
+  // If routeWebSocket is unsupported at the installed version, WebSockets cannot be intercepted
+  // via context routing without unsafe substitutes; HTTP routes remain strictly intercepted.
+  if (typeof context.routeWebSocket === 'function') {
+    await context.routeWebSocket('**/*', async (ws) => {
+      try {
+        const rawUrl = typeof ws.url === 'function' ? ws.url() : String(ws.url || '');
+        // Map ws:// to http:// and wss:// to https:// so egress policy validation
+        // (allowPrivateNetwork, allowLoopback, allowedHosts, blockedHosts, and DNS resolution)
+        // evaluates destination host/IP with identical semantics to HTTP.
+        let checkUrl = rawUrl;
+        if (/^ws:\/\//i.test(checkUrl)) {
+          checkUrl = 'http://' + checkUrl.slice(5);
+        } else if (/^wss:\/\//i.test(checkUrl)) {
+          checkUrl = 'https://' + checkUrl.slice(6);
+        }
+        const opts = getPolicyOpts();
+        const validation = await validateEgressUrl(checkUrl, opts);
+        if (!validation.ok) {
+          if (typeof ws.close === 'function') {
+            return await ws.close({ code: 1008, reason: 'accessdenied' }).catch(() => {});
+          }
+          return;
+        }
+        if (typeof ws.connectToServer === 'function') {
+          return ws.connectToServer();
+        }
+      } catch {
+        if (typeof ws.close === 'function') {
+          return await ws.close({ code: 1008, reason: 'accessdenied' }).catch(() => {});
+        }
+      }
     });
-  } catch {}
+  }
+
+  context._egressFilterInstalled = true;
 }
 /**
  * @param {unknown} expr
@@ -269,8 +353,7 @@ export async function installContextEgressFilter(context, sessionOrPolicy) {
 export function assertEvaluateExpression(expr) {
   const text = String(expr || '');
   if (!text) throw new Error('EXPRESSION_REQUIRED_FOR_EVALUATE');
-  if (text.length > MAX_EVALUATE_EXPRESSION_CHARS)
-    throw new Error('BROWSER_EXPRESSION_TOO_LARGE');
+  if (text.length > MAX_EVALUATE_EXPRESSION_CHARS) throw new Error('BROWSER_EXPRESSION_TOO_LARGE');
   return text;
 }
 /** Max model-supplied regex length for find/filter: bounds pattern-side work. */
@@ -322,10 +405,7 @@ export function assertSafeRegexPattern(pattern) {
           ? /** @type {{quant: boolean, alt: boolean}} */ (stack.pop())
           : { quant: false, alt: false };
       const next = s[i + 1];
-      if (
-        (next === '*' || next === '+' || next === '?' || next === '{') &&
-        (g.quant || g.alt)
-      )
+      if ((next === '*' || next === '+' || next === '?' || next === '{') && (g.quant || g.alt))
         throw new Error('BROWSER_REGEX_REJECTED');
       const top = stack[stack.length - 1];
       if (top) top.quant = true;
@@ -416,7 +496,7 @@ export function resolveUploadPath(p, readRoots, downloadsDir, allowAll = false) 
   return denied;
 }
 
-class BrowserSession {
+export class BrowserSession {
   /**
    * @param {string} id
    * @param {Record<string, any>} [options]
@@ -497,12 +577,14 @@ class BrowserSession {
 
 export class BrowserManager {
   /**
-   * @param {{dataDir?: string|null, root?: string|null, env?: NodeJS.ProcessEnv}} [options]
+   * @param {{dataDir?: string|null, root?: string|null, env?: NodeJS.ProcessEnv, playwrightVersion?: string|null}} [options]
    */
   constructor(options = {}) {
     this.rt = resolveBrowserRuntime(options);
     /** @type {Record<string, any>|null} */
     this.core = null;
+    /** @type {string|null} Playwright runtime version when provided; falls back to core.__version / pin. */
+    this.playwrightVersion = options.playwrightVersion || null;
     /** @type {Map<string, BrowserSession>} */
     this.sessions = new Map();
     /** @type {Map<string, PWBrowser>} */
@@ -539,6 +621,19 @@ export class BrowserManager {
       playwright: BROWSER_RUNTIME_PIN.playwright,
       revision: expectedChromiumRevision(this.rt.coreDir)
     };
+  }
+
+  /**
+   * Asserts serviceWorkers: 'block' is supported by the runtime (>= 1.48.0).
+   * @param {string} [version]
+   */
+  assertServiceWorkersBlockSupported(version) {
+    const v =
+      version ||
+      this.playwrightVersion ||
+      (this.core && this.core.__version) ||
+      BROWSER_RUNTIME_PIN.playwright;
+    assertServiceWorkersBlockSupported(v);
   }
 
   /**
@@ -716,6 +811,9 @@ export class BrowserManager {
    */
   async launchManaged(session, options = {}) {
     const core = await this.coreApi();
+    const pwVersion =
+      this.playwrightVersion || (core && core.__version) || BROWSER_RUNTIME_PIN.playwright;
+    assertServiceWorkersBlockSupported(pwVersion);
     const profileId = options.profileId || null;
     if (profileId) {
       if (!/^[A-Za-z0-9_-]{1,64}$/.test(profileId)) throw new Error('BROWSER_POLICY_DENIED');
@@ -725,6 +823,9 @@ export class BrowserManager {
       ensureDir(this.rt.profilesDir);
       let context = null;
       try {
+        const pwVersion =
+          this.playwrightVersion || (core && core.__version) || BROWSER_RUNTIME_PIN.playwright;
+        assertServiceWorkersBlockSupported(pwVersion);
         const resolvedProfile = resolveChromiumExecutable({
           browsersDir: this.rt.browsersDir,
           headless: session.headless
@@ -742,6 +843,7 @@ export class BrowserManager {
           ...(session.locale ? { locale: session.locale } : {}),
           ...(session.timezone ? { timezoneId: session.timezone } : {}),
           ...(session.userAgent ? { userAgent: session.userAgent } : {}),
+          serviceWorkers: 'block',
           acceptDownloads: true,
           downloadsPath: session.downloadsDir || path.join(this.rt.downloadsDir, session.id),
           timeout: 60000,
@@ -771,16 +873,24 @@ export class BrowserManager {
       session.ownsBrowser = false;
       let context = null;
       try {
+        const pwVersion =
+          this.playwrightVersion ||
+          (this.core && this.core.__version) ||
+          BROWSER_RUNTIME_PIN.playwright;
+        assertServiceWorkersBlockSupported(pwVersion);
         context = await browser.newContext({
           viewport: session.viewport,
           ...(session.locale ? { locale: session.locale } : {}),
           ...(session.timezone ? { timezoneId: session.timezone } : {}),
           ...(session.userAgent ? { userAgent: session.userAgent } : {}),
+          serviceWorkers: 'block',
           acceptDownloads: true,
           downloadsPath: session.downloadsDir || path.join(this.rt.downloadsDir, session.id)
         });
-      } catch {
-        throw new Error('BROWSER_LAUNCH_FAILED');
+      } catch (e) {
+        const msg = e && typeof e === 'object' && 'message' in e ? String(e.message) : '';
+        if (/^BROWSER_[A-Z_]+/.test(msg)) throw e;
+        throw Object.assign(new Error('BROWSER_LAUNCH_FAILED'), { cause: e });
       }
       session.context = context;
     }
@@ -830,7 +940,14 @@ export class BrowserManager {
     session.downloadsDir = session.downloadsDir || path.join(this.rt.downloadsDir, session.id);
     ensureDir(session.downloadsDir);
     if (!session.context) throw new Error('BROWSER_EXISTING_ATTACH_FAILED');
-    await this.wireContext(session, session.context);
+    try {
+      await this.wireContext(session, session.context);
+    } catch (e) {
+      try {
+        if (browser && typeof browser.close === 'function') await browser.close();
+      } catch {}
+      throw e;
+    }
     const pages = typeof session.context.pages === 'function' ? session.context.pages() : [];
     if (pages.length === 0) await this.newPage(session, null);
     else {
@@ -844,7 +961,24 @@ export class BrowserManager {
    */
   async wireContext(session, context) {
     if (!context) return;
-    await installContextEgressFilter(context, session);
+    try {
+      await installContextEgressFilter(context, session);
+    } catch (e) {
+      try {
+        if (typeof context.close === 'function') await context.close();
+      } catch {}
+      if (session) {
+        session.state = 'error';
+        if (session.ownsBrowser && session.browser && typeof session.browser.close === 'function') {
+          try {
+            await session.browser.close();
+          } catch {}
+        }
+      }
+      const msg = e && typeof e === 'object' && 'message' in e ? String(e.message) : '';
+      if (/^BROWSER_[A-Z_]+/.test(msg)) throw e;
+      throw Object.assign(new Error('BROWSER_EGRESS_FILTER_FAILED'), { cause: e });
+    }
     try {
       context.setDefaultTimeout(BROWSER_DEFAULTS.actionTimeoutMs);
     } catch {}
@@ -1663,11 +1797,12 @@ export function staleSessionHint(id, err = null) {
   let state = 'missing';
   if (typeof err === 'string' && err) state = err;
   else if (err && typeof err === 'object') {
-    const detailState =
-      /** @type {{detail?: {state?: unknown}}} */ (err).detail?.state;
+    const detailState = /** @type {{detail?: {state?: unknown}}} */ (err).detail?.state;
     if (typeof detailState === 'string' && detailState) state = detailState;
     else {
-      const m = /^BROWSER_SESSION_(NOT_FOUND|LOST)/.exec(String(/** @type {{message?: unknown}} */ (err).message || ''));
+      const m = /^BROWSER_SESSION_(NOT_FOUND|LOST)/.exec(
+        String(/** @type {{message?: unknown}} */ (err).message || '')
+      );
       if (m) state = m[1] === 'LOST' ? 'lost' : 'missing';
     }
   }

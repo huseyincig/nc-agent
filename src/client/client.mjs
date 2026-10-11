@@ -240,7 +240,7 @@ try {
   ensureDaemonPath();
 } catch {}
 
-const VERSION = '0.17.24';
+const VERSION = '0.17.33';
 const layout = ncLayout();
 const serverUrl = (process.env.NC_SERVER_URL || 'https://mcp.nodecommand.app').replace(/\/$/, '');
 if (process.env.NODE_ENV !== 'development') {

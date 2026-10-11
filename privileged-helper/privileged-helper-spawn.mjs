@@ -1,4 +1,7 @@
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+
+const SWEEP_VERIFY_TOLERANCE_MS = 120 * 1000;
 
 /**
  * Leak-free spawn capture for the privileged helper daemon (root/SYSTEM).
@@ -50,24 +53,119 @@ export function killSpawnTree(child, platform = process.platform, force = false,
 
 /**
  * P2-04: probe whether a detached POSIX process GROUP is still alive before
- * a deferred group SIGKILL. Signal 0 delivers nothing; ESRCH means the
- * group is gone (skip the kill — the PGID may already be recycled) while
- * any other outcome (alive, EPERM, ...) assumes alive so the escalation
- * still sweeps orphans. POSIX-only by construction: callers gate on
- * platform !== 'win32' (Windows never uses negative-pid signaling and the
- * win32 path uses taskkill /T instead).
+ * a deferred group SIGKILL. Re-verifies PGID identity against the recorded
+ * start time before authorizing the signal to prevent PID-reuse races.
+ * If unverifiable, skips signal (fail-safe).
  * @param {number|undefined|null} pid group-leader pid (pgid == pid when detached)
- * @returns {boolean} true unless the group is provably gone
+ * @param {string|number} [startedAtIso] expected process/group start time ISO
+ * @param {{platform?: string}} [options]
+ * @returns {Promise<boolean>|boolean} true unless the group is provably gone or identity mismatch
  */
-function groupAlive(pid) {
+export async function verifyProcessStartTime(
+  pid,
+  startedAtIso,
+  { platform = process.platform, execFile = null } = {}
+) {
+  const expected = Date.parse(String(startedAtIso || ''));
+  if (!Number.isFinite(expected)) return null;
+  try {
+    if (platform === 'linux') {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const afterComm = stat
+        .slice(stat.lastIndexOf(')') + 1)
+        .trim()
+        .split(/\s+/);
+      const ticks = Number(afterComm[19]);
+      if (!Number.isFinite(ticks)) return null;
+      const btime = Number(
+        fs
+          .readFileSync('/proc/stat', 'utf8')
+          .split('\n')
+          .find((l) => l.startsWith('btime'))
+          ?.split(/\s+/)[1]
+      );
+      const ticksPerSec = 100;
+      if (!Number.isFinite(btime)) return null;
+      const actualMs = (btime + ticks / ticksPerSec) * 1000;
+      return Math.abs(actualMs - expected) <= SWEEP_VERIFY_TOLERANCE_MS;
+    }
+    if (platform === 'win32') return null;
+    const { execFile: ef } = execFile || (await import('node:child_process'));
+    const { promisify } = await import('node:util');
+    const run = promisify(ef);
+    const { stdout } = await run('ps', ['-o', 'lstart=', '-p', String(pid)], {
+      timeout: 10000
+    });
+    const actualMs = Date.parse(String(stdout || '').trim());
+    if (!Number.isFinite(actualMs)) return null;
+    return Math.abs(actualMs - expected) <= SWEEP_VERIFY_TOLERANCE_MS;
+  } catch {
+    return null;
+  }
+}
+
+export async function verifyPgidIdentity(
+  pid,
+  startedAtIso,
+  { platform = process.platform, execFile = null } = {}
+) {
   const id = Math.floor(Number(pid));
   if (!Number.isInteger(id) || id < 2) return false;
+  const leaderVerdict = await verifyProcessStartTime(id, startedAtIso, { platform, execFile });
+  if (leaderVerdict === true) return true;
+  if (leaderVerdict === false) return false;
+  if (platform === 'linux') {
+    try {
+      const expected = Date.parse(String(startedAtIso || ''));
+      if (!Number.isFinite(expected)) return false;
+      const btime = Number(
+        fs
+          .readFileSync('/proc/stat', 'utf8')
+          .split('\n')
+          .find((l) => l.startsWith('btime'))
+          ?.split(/\s+/)[1]
+      );
+      if (!Number.isFinite(btime)) return false;
+      const ticksPerSec = 100;
+      const pids = fs.readdirSync('/proc').filter((p) => /^\d+$/.test(p));
+      for (const p of pids) {
+        try {
+          const s = fs.readFileSync(`/proc/${p}/stat`, 'utf8');
+          const afterComm = s.slice(s.lastIndexOf(')') + 1).trim().split(/\s+/);
+          const pgrp = Number(afterComm[2]);
+          if (pgrp === id) {
+            const ticks = Number(afterComm[19]);
+            if (Number.isFinite(ticks)) {
+              const actualMs = (btime + ticks / ticksPerSec) * 1000;
+              if (Math.abs(actualMs - expected) <= SWEEP_VERIFY_TOLERANCE_MS) {
+                return true;
+              }
+            }
+          }
+        } catch {}
+      }
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+export async function groupAlive(pid, startedAtIso, { platform = process.platform } = {}) {
+  const id = Math.floor(Number(pid));
+  if (!Number.isInteger(id) || id < 2) return false;
+  let alive = false;
   try {
     process.kill(-id, 0);
-    return true;
+    alive = true;
   } catch (e) {
-    return /** @type {NodeJS.ErrnoException} */ (e)?.code !== 'ESRCH';
+    alive = /** @type {NodeJS.ErrnoException} */ (e)?.code !== 'ESRCH';
   }
+  if (!alive) return false;
+  if (startedAtIso !== undefined) {
+    return await verifyPgidIdentity(id, startedAtIso, { platform });
+  }
+  return true;
 }
 /**
  * @param {ReturnType<typeof setTimeout>|undefined} timer
@@ -140,6 +238,7 @@ export function runPrivilegedCapture(cmd, args, {
     : { ...process.env, ...(env || {}) };
   return new Promise((resolve) => {
     let child;
+    const startedAtIso = new Date().toISOString();
     try {
       child = spawn(cmd, args, {
         cwd: cwd || '/',
@@ -199,12 +298,16 @@ export function runPrivilegedCapture(cmd, args, {
       try {
         killSpawnTree(child, platform, false, tree);
       } catch {}
-      escalate = setTimeout(() => {
+      escalate = setTimeout(async () => {
         try {
-          // P2-04 fail-safe: re-verify before the SIGKILL. Group provably
-          // gone (ESRCH) ⇒ skip the signal (PGID-reuse safety, PASS-1);
-          // otherwise the group kill proceeds (no orphan, P2-04).
-          if (!(groupKill && !groupAlive(child?.pid))) killSpawnTree(child, platform, true, tree);
+          // Re-verify PGID identity before group SIGKILL (PID-reuse safety).
+          // If group is gone (ESRCH) or identity is unverifiable, skip signal.
+          if (groupKill) {
+            const isAlive = await groupAlive(child?.pid, startedAtIso, { platform });
+            if (isAlive) killSpawnTree(child, platform, true, tree);
+          } else {
+            killSpawnTree(child, platform, true, tree);
+          }
         } catch {}
         try {
           child.stdout?.destroy();
