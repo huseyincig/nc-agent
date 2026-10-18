@@ -14,6 +14,7 @@ Thank you for contributing to the Node Command native agent!
 4. **Canonical Boundaries**:
    - Agent logic belongs in this repository (`nc-agent`).
    - Wire contract, schema, and MCP tool definition changes belong in [nc-protocol](https://github.com/huseyincig/nc-protocol).
+   - Product documentation, client examples, and manifests belong in [NodeCommand](https://github.com/huseyincig/NodeCommand).
    - Public wire changes require a protocol bump in `nc-protocol` first.
 
 ---

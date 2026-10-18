@@ -1,43 +1,77 @@
 # nc-agent
 
-The official open-source native host agent and CLI installer for the [Node Command](https://nodecommand.app) enterprise platform.
+The official open-source native host agent and CLI installer for the
+[Node Command](https://nodecommand.app) platform.
 
-Built strictly on native Node.js 24+ ECMAScript Modules (`.mjs`) with **zero external runtime dependencies**, `nc-agent` provides secure remote execution, browser automation, process monitoring, diagnostics, and outbound-only WebSocket tunnels.
+Built strictly on native Node.js ECMAScript Modules (`.mjs`) with **zero
+external runtime dependencies**, `nc-agent` provides secure remote
+execution, browser automation, process and service management, diagnostics,
+and outbound-only WebSocket tunnels.
 
 ---
 
-## Quick Start (Device Pairing)
+## Quick start
 
-Pair a machine with your Node Command organization via the browser device authorization flow (RFC 8628):
+One command installs, enrolls, and verifies the agent on this machine:
 
 ```bash
 npx nc-agent
 ```
 
-This prints a one-time verification code and authorization URL. Once approved in the browser, the agent configures and starts automatically.
+The CLI prints an eight-character code and a verification URL. Open the URL
+in your browser, sign in to your Node Command workspace, enter the code, and
+approve. The agent then installs itself as a service — machine-wide when
+elevated, per-user otherwise — and reports online. No inbound ports and no
+firewall changes.
 
-### CLI Subcommands
+For hands-off enrollment, redeem the dashboard's one-time enrollment token
+directly (single-use, short-lived):
 
 ```bash
-npx nc-agent setup            # Automatic mode (system service if root, user daemon otherwise)
-npx nc-agent setup --system   # Force system-level service installation
-npx nc-agent setup --user     # Force non-elevated user service installation
-npx nc-agent remove           # Uninstall and remove the agent
-npx nc-agent --diagnostics    # Generate and preview a redacted support bundle
+npx nc-agent setup <host_id> <token>
 ```
+
+### CLI reference
+
+```bash
+npx nc-agent                           # pair via browser device flow and install
+npx nc-agent setup [<host_id> <token>] # install; with arguments, redeem the dashboard enrollment
+npx nc-agent uninstall [--yes]         # remove the agent (alias: remove; confirms unless --yes)
+npx nc-agent --diagnostics             # preview a redacted support bundle (writes nothing)
+npx nc-agent --diagnostics --apply     # write the bundle for a support ticket
+npx nc-agent --help                    # full usage
+```
+
+Requirements: Node.js 24 or newer, on Linux, macOS, or Windows.
 
 ---
 
-## Standalone Development
+## What it does
 
-External contributors can clone, run, test, and package `nc-agent` standalone without the private control-plane monorepo:
+- Executes admitted operations on the machine: shell commands, file reads
+  and mutations, log queries and streams.
+- Manages processes, services, OS packages, Git repositories, Docker
+  containers, and GUI/browser sessions through a pinned Playwright runtime.
+- Captures diagnostics and structured document extraction for AI analysis.
+- Enforces host policy and network egress rules locally — capabilities
+  default to deny until granted.
+- Proves every request with an Ed25519 device key enrolled out-of-band.
+- Updates itself from staged, hash-verified releases with automatic
+  rollback on a failed health check.
+
+---
+
+## Standalone development
+
+External contributors can clone, run, test, and package `nc-agent`
+standalone without any private control-plane sources.
 
 ### Prerequisites
 
 - Node.js >= 24.0.0
 - Git
 
-### Clone & Run
+### Clone & run
 
 ```bash
 # Clone the repository
@@ -48,7 +82,7 @@ cd nc-agent
 npm start
 ```
 
-### Running Tests
+### Running tests
 
 ```bash
 # Run the complete test suite
@@ -60,11 +94,11 @@ node --test tests/shell.test.mjs
 node --test tests/browser.test.mjs
 ```
 
-### Syntax Validation & Release Packaging
+### Syntax validation & release packaging
 
 ```bash
 # Check syntax across all source files
-node --check bin/nc.mjs src/client/launcher.mjs tests/*.mjs
+node --check bin/nc.mjs bin/nodecommand-agent.mjs src/client/launcher.mjs tests/*.mjs
 
 # Package client distribution tarball
 npm run package
@@ -72,13 +106,13 @@ npm run package
 
 ---
 
-## Repository Layout
+## Repository layout
 
 ```text
 nc-agent/
 ├── bin/                 # CLI entrypoint (nc.mjs) and npx dispatcher
 ├── src/                 # Full agent runtime
-│   ├── browser/         # Browser automation manager and Playwright integration
+│   ├── browser/         # Pinned Playwright runtime and automation manager
 │   ├── client/          # Core lifecycle, WebSocket client, state, launcher
 │   ├── containers/      # Docker / Compose inspection and operations
 │   ├── diagnostics/     # Health bundles and system diagnostics
@@ -102,9 +136,29 @@ nc-agent/
 
 ---
 
+## Documentation
+
+- [Filesystem layout and install roots](docs/FILESYSTEM_LAYOUT.md)
+- [Migration and update runbook](docs/MIGRATION_RUNBOOK.md)
+- [Uninstall](docs/UNINSTALL.md)
+- [Security policy](SECURITY.md) — coordinated disclosure, trust model
+
+---
+
+## Related repositories
+
+- [NodeCommand](https://github.com/huseyincig/NodeCommand) — product
+  documentation, client examples, and manifests.
+- [nc-protocol](https://github.com/huseyincig/nc-protocol) — the canonical
+  wire contracts and MCP tool schemas implemented by this agent.
+
+---
+
 ## Contributing
 
-We welcome community contributions! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on code style, testing requirements, security considerations, and how to submit pull requests.
+We welcome community contributions! Please read
+[CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on code style, testing
+requirements, security considerations, and how to submit pull requests.
 
 ---
 

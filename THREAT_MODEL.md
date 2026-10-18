@@ -25,5 +25,5 @@ device identity key, update channel integrity.
 
 ## Non-goals
 
-Hub-side tenant isolation, billing fraud, and cloud infrastructure threats
-belong to `nc-platform` / `nc-ops`, not this repo.
+Hub-side tenant isolation, billing fraud, and cloud infrastructure
+threats are out of scope for this repository.
