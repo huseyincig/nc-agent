@@ -15,7 +15,7 @@ and outbound-only WebSocket tunnels.
 One command installs, enrolls, and verifies the agent on this machine:
 
 ```bash
-npx nc-agent
+npx node-command
 ```
 
 The CLI prints an eight-character code and a verification URL. Open the URL
@@ -28,19 +28,29 @@ For hands-off enrollment, redeem the dashboard's one-time enrollment token
 directly (single-use, short-lived):
 
 ```bash
-npx nc-agent setup <host_id> <token>
+npx node-command <host_id> <token>
 ```
 
 ### CLI reference
 
 ```bash
-npx nc-agent                           # pair via browser device flow and install
-npx nc-agent setup [<host_id> <token>] # install; with arguments, redeem the dashboard enrollment
-npx nc-agent uninstall [--yes]         # remove the agent (alias: remove; confirms unless --yes)
-npx nc-agent --diagnostics             # preview a redacted support bundle (writes nothing)
-npx nc-agent --diagnostics --apply     # write the bundle for a support ticket
-npx nc-agent --help                    # full usage
+npx node-command                           # pair via browser device flow and install
+npx node-command <host_id> <token>         # install; redeem the dashboard enrollment directly
+npx node-command uninstall [--yes]         # remove the agent (alias: remove; confirms unless --yes)
+npx node-command --diagnostics             # preview a redacted support bundle (writes nothing)
+npx node-command --diagnostics --apply     # write the bundle for a support ticket
+npx node-command --help                    # full usage
 ```
+
+### npm packages
+
+The same CLI is published under two npm package names:
+
+- **`node-command`** (unscoped) — the primary package; new docs and
+  scripts should use `npx node-command`.
+- **`nc-agent`** — still published and actively maintained; `npx nc-agent`
+  resolves to the identical CLI, and every command above works with either
+  name.
 
 Requirements: Node.js 24 or newer, on Linux, macOS, or Windows.
 
