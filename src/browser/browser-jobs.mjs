@@ -14,7 +14,16 @@ import {
   CONSOLE_SEVERITY
 } from './browser-manager.mjs';
 import { validateEgressUrl, auditProjectionUrl } from '../policy/egress-policy.mjs';
-import { expectedChromiumRevision, installedChromiumRevisions } from './browser-runtime.mjs';
+import {
+  BROWSER_RUNTIME_PIN,
+  expectedChromiumRevision,
+  managedBrowserArtifactStatus,
+  resolveBrowserProvider,
+  loadPlaywrightCore,
+  browserLaunchEnv,
+  rejectInstalledBrowser,
+  scheduleConvergenceRetry
+} from './browser-runtime.mjs';
 import { validateBrowserLaunch } from './browser-runtime.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -193,7 +202,8 @@ async function enforceContextEgressFilter(manager, key, session) {
     await installContextEgressFilter(session.context, session);
   } catch (err) {
     try {
-      if (typeof session.context?.close === 'function') await session.context.close();
+      if (session.mode !== 'existing' && typeof session.context?.close === 'function')
+        await session.context.close();
     } catch {}
     try {
       if (session.ownsBrowser && typeof session.browser?.close === 'function') {
@@ -248,10 +258,14 @@ export async function browserCreateJob(job) {
     return failJob(started, 'BROWSER_RUNTIME_MISSING');
   }
   if (mode !== 'existing') {
-    const rt = manager.paths();
-    const rev = expectedChromiumRevision(rt.coreDir);
-    if (!installedChromiumRevisions(rt.browsersDir).includes(rev))
+    // The requested launch artifact must resolve as a file: a revision
+    // directory name proves nothing (HHC-PC 2026-10-17: a full-only
+    // chromium-<rev> dir gated a headless launch that could never resolve).
+    const resolved = await manager.provider(headless);
+    if (!resolved.ok || !resolved.executablePath) {
+      scheduleConvergenceRetry({ base: manager.paths().base });
       return failJob(started, 'BROWSER_INSTALLATION_MISSING');
+    }
   }
   try {
     const session = await manager.createSession(key, {
@@ -602,6 +616,10 @@ export async function browserInteractJob(job) {
             if (accept) await pending.dialog.accept(String(p.prompt_text || ''));
             else await pending.dialog.dismiss();
           } catch {
+            // L01a-16: a failed accept/dismiss must not leave a stale
+            // pendingDialog (cleared timer, dead dialog) behind: the next
+            // handle_dialog would act on it instead of reporting BLOCKED.
+            s.pendingDialog = null;
             throw new Error('BROWSER_DIALOG_BLOCKED');
           }
           s.pendingDialog = null;
@@ -625,11 +643,35 @@ export async function browserInteractJob(job) {
           const cur = s.currentPage();
           if (!cur) throw new Error('BROWSER_PAGE_NOT_FOUND');
           let out = null;
+          let timer;
+          let timedOut = false;
           try {
             // Expression semantics: page.evaluate awaits a returned promise.
-            out = await cur.page.evaluate(expr);
+            out = await Promise.race([
+              cur.page.evaluate(expr),
+              new Promise((_, reject) => {
+                timer = setTimeout(() => {
+                  timedOut = true;
+                  // The race cannot cancel evaluation, and owned-page close
+                  // may not settle. Quarantine the whole session: another tab
+                  // can share origin state with this still-running script.
+                  s.state = 'error';
+                  const owned = s.pages.get(cur.pageId)?.sessionCreated === true;
+                  s.pages.delete(cur.pageId);
+                  if (s.currentPageId === cur.pageId) s.currentPageId = null;
+                  s.refs.clear();
+                  if (owned) {
+                    try { cur.page.close().catch(() => {}); } catch {}
+                  }
+                  reject(new Error('BROWSER_ACTION_TIMEOUT'));
+                }, timeoutMs);
+              })
+            ]);
           } catch {
+            if (timedOut) throw new Error('BROWSER_ACTION_TIMEOUT');
             throw new Error('BROWSER_EVALUATE_FAILED');
+          } finally {
+            clearTimeout(timer);
           }
           let text = '';
           try {
@@ -708,7 +750,7 @@ export async function browserInteractJob(job) {
           `Action '${action}' executed`
         );
       } catch (e) {
-        s.state = 'ready';
+        if (s.state === 'busy') s.state = 'ready';
         return failJob(started, mapBrowserError(e), {
           ...(key !== DEFAULT_SESSION ? { browser_id: key } : {})
         });
@@ -1167,8 +1209,7 @@ export async function browserNetworkJob(job) {
   }
   if (typeof p.filter === 'string' && p.filter) {
     try {
-      // P3-D3: sync test() has no timeout; reject nested-quantifier
-      // patterns that backtrack exponentially (fail closed, same code).
+      // Sync test() has no timeout: accept only the linear subset.
       void new RegExp(assertSafeRegexPattern(p.filter));
     } catch {
       return failJob(started, 'BROWSER_FILTER_INVALID');
@@ -1304,6 +1345,31 @@ export async function browserHealthJob(options = {}) {
   const manager = getBrowserManager();
   const coreDir = options.coreDir || manager.paths().coreDir;
   const browsersDir = options.browsersDir || manager.paths().browsersDir;
+  // Same complete artifact set as the light health gate: a launch validation
+  // on a partial set can only mislead, so fail closed before paying for it.
+  const revision = expectedChromiumRevision(coreDir);
+  const selected = await resolveBrowserProvider({ coreDir, browsersDir });
+  if (selected.installed) {
+    let browser = null;
+    try {
+      const core = await loadPlaywrightCore(coreDir);
+      if (!core) throw new Error('BROWSER_RUNTIME_MISSING');
+      browser = await core.chromium.launch({ headless: true, executablePath: selected.executablePath,
+        env: browserLaunchEnv({ browsersDir }), timeout: 60000,
+        args: ['--no-first-run', '--no-default-browser-check', '--disable-dev-shm-usage'] });
+      await browser.close();
+      browser = null;
+      return okJob(started, { available: true, playwright: BROWSER_RUNTIME_PIN.playwright, revision, duration_ms: Date.now() - started });
+    } catch (error) {
+      if (browser) { try { await browser.close(); } catch { return failJob(started, 'BROWSER_LAUNCH_FAILED'); } }
+      if (/^BROWSER_(?!LAUNCH_FAILED|INSTALLATION_MISSING)/.test(String(error?.message || '')))
+        return failJob(started, String(error.message));
+      rejectInstalledBrowser(selected.executablePath);
+      scheduleConvergenceRetry({ base: manager.paths().base });
+    }
+  }
+  if (!managedBrowserArtifactStatus({ browsersDir, revision }).ok)
+    return failJob(started, 'BROWSER_INSTALLATION_MISSING', { revision });
   const probe = await validateBrowserLaunch({ coreDir, browsersDir, headless: true });
   if (!probe.ok) return failJob(started, probe.error || 'BROWSER_NOT_AVAILABLE');
   return okJob(started, {

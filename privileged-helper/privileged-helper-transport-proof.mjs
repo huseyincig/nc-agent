@@ -53,6 +53,52 @@ export function verifyTransportProof(proof, payloadSha256, secretHex) {
 }
 
 /**
+ * L01b-4: reply authentication. The daemon HMACs every reply frame with
+ * the same file-secret used for request proofs, so a local impostor on
+ * the pipe cannot forge privileged-helper replies (request auth alone
+ * leaves the response leg spoofable). The digest covers the canonical
+ * reply body (JSON without the proof field itself).
+ * @param {unknown} reply
+ * @returns {string|null} sha256 hex of the canonical reply body
+ */
+export function replyDigest(reply) {
+  if (!reply || typeof reply !== 'object' || Array.isArray(reply)) return null;
+  const { reply_proof: _dropped, ...body } = /** @type {Record<string, unknown>} */ (reply);
+  try {
+    return crypto.createHash('sha256').update(JSON.stringify(body), 'utf8').digest('hex');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * @param {unknown} reply
+ * @param {string} secretHex
+ * @returns {Record<string, unknown>|null} reply with reply_proof attached, or null
+ */
+export function sealHelperReply(reply, secretHex) {
+  if (!reply || typeof reply !== 'object' || Array.isArray(reply)) return null;
+  const digest = replyDigest(reply);
+  const proof = digest ? computeTransportProof(digest, secretHex) : null;
+  if (!proof) return null;
+  return { .../** @type {Record<string, unknown>} */ (reply), reply_proof: proof };
+}
+
+/**
+ * @param {unknown} reply
+ * @param {string} secretHex
+ * @returns {boolean}
+ */
+export function verifyHelperReply(reply, secretHex) {
+  if (!reply || typeof reply !== 'object' || Array.isArray(reply)) return false;
+  const rec = /** @type {Record<string, unknown>} */ (reply);
+  if (typeof rec.reply_proof !== 'string') return false;
+  const digest = replyDigest(rec);
+  if (!digest) return false;
+  return verifyTransportProof(rec.reply_proof, digest, secretHex);
+}
+
+/**
  * @param {string} [secretFile]
  * @returns {Promise<string|null>}
  */

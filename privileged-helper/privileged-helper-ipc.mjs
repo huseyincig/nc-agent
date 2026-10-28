@@ -1,4 +1,5 @@
 import net from 'node:net';
+import { verifyHelperReply } from './privileged-helper-transport-proof.mjs';
 export const PRIVILEGED_HELPER_MAX_FRAME_BYTES = 128 * 1024;
 export const PRIVILEGED_HELPER_ENDPOINTS = Object.freeze({
   linux: '/run/nc/privileged-helper-v1.sock',
@@ -107,6 +108,10 @@ export function decodePrivilegedHelperFrame(value) {
  * @param {string|null} [options.transportProof] file-secret HMAC proof for
  * transports without kernel peer credentials (win32 named pipe); attached
  * outside the central signature envelope and verified by the daemon first.
+ * @param {string|null} [options.replySecret] when set, every reply frame
+ * must carry a valid reply_proof HMAC under this secret (L01b-4); replies
+ * without one throw PRIVILEGED_HELPER_PEER_UNVERIFIED. Opt-in so the
+ * unix-socket transports (kernel peer credentials) are unaffected.
  */
 export function invokePrivilegedHelper(
   request,
@@ -114,7 +119,8 @@ export function invokePrivilegedHelper(
     platform = process.platform,
     endpoint = privilegedHelperEndpoint(platform),
     timeoutMs = 5000,
-    transportProof = null
+    transportProof = null,
+    replySecret = null
   } = {}
 ) {
   return new Promise((resolve, reject) => {
@@ -131,6 +137,14 @@ export function invokePrivilegedHelper(
       clearTimeout(timer);
       socket.destroy();
       error ? reject(error) : resolve(value);
+    };
+    // L01b-4: verified decode — when replySecret is set, a reply without a
+    // valid reply_proof HMAC is a forged frame: reject, never deliver.
+    const decodeReply = (data) => {
+      const decoded = decodePrivilegedHelperFrame(data);
+      if (replySecret && !verifyHelperReply(decoded, replySecret))
+        throw new Error('PRIVILEGED_HELPER_PEER_UNVERIFIED');
+      return decoded;
     };
     const timer = setTimeout(() => finish(new Error('PRIVILEGED_HELPER_TIMEOUT')), timeoutMs);
     // The watchdog must not pin the event loop by itself (a 10-minute
@@ -156,7 +170,7 @@ export function invokePrivilegedHelper(
     });
     socket.once('end', () => {
       try {
-        finish(null, decodePrivilegedHelperFrame(data));
+        finish(null, decodeReply(data));
       } catch (error) {
         finish(error);
       }
@@ -171,7 +185,7 @@ export function invokePrivilegedHelper(
         return;
       }
       try {
-        finish(null, decodePrivilegedHelperFrame(data));
+        finish(null, decodeReply(data));
       } catch (error) {
         finish(error);
       }

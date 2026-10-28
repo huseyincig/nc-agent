@@ -231,8 +231,9 @@ export async function verifyServiceEnabled(platform, service) {
           const { stdout } = await run('launchctl', ['print-disabled', domain], { timeout: 10000 });
           const hit = String(stdout || '')
             .split('\n')
-            .find((l) => l.includes(`"${label}"`));
-          if (hit) return /"disabled"\s*=>\s*true/.test(hit) ? 'disabled' : 'enabled';
+            .map((l) => l.match(/^\s*"([^"]+)"\s*=>\s*(.*?)\s*$/))
+            .find((m) => m && m[1] === label);
+          if (hit) return hit[2] === 'true' ? 'disabled' : hit[2] === 'false' ? 'enabled' : 'unknown';
         } catch {}
       }
       return 'unknown';

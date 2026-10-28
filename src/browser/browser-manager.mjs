@@ -6,7 +6,9 @@ import {
   BROWSER_DEFAULTS,
   BROWSER_RUNTIME_PIN,
   resolveBrowserRuntime,
-  resolveChromiumExecutable,
+  resolveBrowserProvider,
+  rejectInstalledBrowser,
+  scheduleConvergenceRetry,
   loadPlaywrightCore,
   applyBrowsersPathEnv,
   browserLaunchEnv,
@@ -68,8 +70,9 @@ const STATIC_RESOURCE_TYPES = new Set(['image', 'font', 'stylesheet', 'media']);
  * @typedef {Record<string, any>} PWLocator
  * @typedef {Record<string, any>} PWDialog
  * @typedef {Record<string, any>} PWDownload
- * @typedef {{page: PWPage, url: string, title: string}} PageRecord
+ * @typedef {{page: PWPage, url: string, title: string, sessionCreated?: boolean}} PageRecord
  * @typedef {{role: string, name: string, index: number, nameIndex: number, pageId: string, revision: number}} RefEntry
+ * @typedef {BrowserSession & {pendingRequests?: Map<unknown, number>|null}} TrackedBrowserSession
  */
 
 /**
@@ -281,7 +284,7 @@ export async function installContextEgressFilter(context, sessionOrPolicy) {
     };
   };
 
-  await context.route('**/*', async (route, request) => {
+  const requestHandler = async (route, request) => {
     try {
       const rawUrl = typeof request.url === 'function' ? request.url() : String(request.url || '');
       if (rawUrl.startsWith('about:')) {
@@ -306,7 +309,14 @@ export async function installContextEgressFilter(context, sessionOrPolicy) {
     } catch {
       return await route.abort('accessdenied').catch(() => {});
     }
-  });
+  };
+  await context.route('**/*', requestHandler);
+  if (Array.isArray(sessionOrPolicy?.cleanups)) {
+    sessionOrPolicy.cleanups.push(async () => {
+      await context.unroute('**/*', requestHandler);
+      context._egressFilterInstalled = false;
+    });
+  }
 
   // RA-02-08: Intercept WebSocket connections when routeWebSocket is exposed by the context.
   // When available (Playwright >= 1.48), enforce the same egress security policy (blocking
@@ -362,69 +372,63 @@ export const MAX_FIND_REGEX_CHARS = 500;
 export const MAX_REGEX_TEST_CHARS = 4000;
 /**
  * Reject model-supplied regexes that can wedge the agent's single-threaded
- * event loop (P3-D3): sync RegExp.test has no timeout, and nested
- * quantifiers (`(a+)+$`) backtrack exponentially — a 7-char pattern held a
- * probe for 20+ minutes against a 100KB input. Fail closed on quantified
- * groups containing quantifiers or alternation; literals, classes and
- * single-level quantifiers (including `(?:…)` non-capturing groups) stay
- * allowed. Callers map the throw onto their existing invalid-query code.
+ * event loop: accept only a sequence of literals/classes/dots, optional
+ * boundary anchors and at most one quantified atom. An unbounded repeat
+ * must be start-anchored or the final atom (without an end anchor), avoiding
+ * quadratic retries at every input offset. No groups, alternatives,
+ * backreferences, lookarounds or counted repeats. This subset takes linear
+ * time in the input length, including failed unanchored searches.
+ * Callers map rejection onto their existing invalid-query code.
  * @param {unknown} pattern
  * @returns {string} the validated pattern
  */
 export function assertSafeRegexPattern(pattern) {
   const s = String(pattern || '');
   if (!s || s.length > MAX_FIND_REGEX_CHARS) throw new Error('BROWSER_REGEX_REJECTED');
-  const stack = [{ quant: false, alt: false }];
-  let escaped = false;
-  let inClass = false;
+  let hasAtom = false;
+  let quantified = false;
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
     if (c === '\\') {
-      escaped = true;
-      continue;
-    }
-    if (inClass) {
-      if (c === ']') inClass = false;
+      const next = s[++i];
+      if (!next || !/^[dDsSwW\\.^$*+?()[\]{}|/\-]$/.test(next))
+        throw new Error('BROWSER_REGEX_REJECTED');
+      hasAtom = true;
       continue;
     }
     if (c === '[') {
-      inClass = true;
+      let closed = false;
+      for (++i; i < s.length; i++) {
+        if (s[i] === '\\') {
+          const next = s[++i];
+          if (!next || !/^[dDsSwW\\.^$*+?()[\]{}|/\-]$/.test(next))
+            throw new Error('BROWSER_REGEX_REJECTED');
+        } else if (s[i] === ']') {
+          closed = true;
+          break;
+        }
+      }
+      if (!closed) throw new Error('BROWSER_REGEX_REJECTED');
+      hasAtom = true;
       continue;
     }
-    if (c === '(') {
-      stack.push({ quant: false, alt: false });
-      continue;
-    }
-    if (c === ')') {
-      const g =
-        stack.length > 1
-          ? /** @type {{quant: boolean, alt: boolean}} */ (stack.pop())
-          : { quant: false, alt: false };
-      const next = s[i + 1];
-      if ((next === '*' || next === '+' || next === '?' || next === '{') && (g.quant || g.alt))
+    if (c === '^' || c === '$') {
+      if (!((c === '^' && i === 0) || (c === '$' && i === s.length - 1)))
         throw new Error('BROWSER_REGEX_REJECTED');
-      const top = stack[stack.length - 1];
-      if (top) top.quant = true;
+      hasAtom = false;
       continue;
     }
-    if (c === '|') {
-      const top = stack[stack.length - 1];
-      if (top) top.alt = true;
+    if (c === '*' || c === '+' || c === '?') {
+      if (!hasAtom || quantified || (c !== '?' && s[0] !== '^' && i !== s.length - 1))
+        throw new Error('BROWSER_REGEX_REJECTED');
+      quantified = true;
+      hasAtom = false;
       continue;
     }
-    // A '?' right after '(' opens a (?:…)/(?=…)/(?i:…) modifier, not a
-    // quantifier: without this exemption every non-capturing group would
-    // read as "quantified" and break common linear patterns.
-    if (c === '?' && s[i - 1] === '(') continue;
-    if (c === '*' || c === '+' || c === '?' || c === '{') {
-      const top = stack[stack.length - 1];
-      if (top) top.quant = true;
-    }
+    if ('(){}|]'.includes(c)) throw new Error('BROWSER_REGEX_REJECTED');
+    hasAtom = true;
   }
+  try { void new RegExp(s); } catch { throw new Error('BROWSER_REGEX_REJECTED'); }
   return s;
 }
 /**
@@ -547,6 +551,20 @@ export class BrowserSession {
     /** @type {Promise<unknown>} */
     this.queue = Promise.resolve();
     this.policy = options.policy || null;
+    /** @type {Array<() => unknown>} */
+    this.cleanups = [];
+  }
+
+  /** @param {Record<string, any>} emitter @param {string} event @param {(...args: any[]) => void} listener */
+  listen(emitter, event, listener) {
+    emitter.on(event, listener);
+    const cleanup = () => {
+      emitter.removeListener(event, listener);
+      const index = this.cleanups.indexOf(cleanup);
+      if (index >= 0) this.cleanups.splice(index, 1);
+    };
+    this.cleanups.push(cleanup);
+    return cleanup;
   }
 
   touch() {
@@ -558,7 +576,17 @@ export class BrowserSession {
    * @param {() => Promise<unknown>} fn
    */
   enqueue(fn) {
-    const run = this.queue.then(fn, fn);
+    const started = Date.now();
+    const execute = () => {
+      // A preceding operation may invalidate a session after this job was
+      // admitted. Never let its callback reset a terminal state to busy.
+      if (['lost', 'error', 'closing', 'closed'].includes(this.state)) {
+        const error = staleSessionError(this.id, this.state);
+        return failJob(started, error.code, staleSessionHint(this.id, error));
+      }
+      return fn();
+    };
+    const run = this.queue.then(execute, execute);
     this.queue = run.catch(() => {});
     return run;
   }
@@ -575,17 +603,34 @@ export class BrowserSession {
   }
 }
 
+/**
+ * L01a-5: bound a request-timing map like the network log (evict oldest).
+ * Exported for tests. Insertion-ordered Maps make the first key the oldest.
+ * @param {Map<unknown, unknown>} pending
+ * @param {number} [cap]
+ */
+export function capPendingTimings(pending, cap = BROWSER_DEFAULTS.maxPendingEntries) {
+  const limit = Math.max(1, Math.min(100000, Math.floor(Number(cap) || 0) || 500));
+  while (pending.size > limit) {
+    const oldest = pending.keys().next();
+    if (oldest.done) break;
+    pending.delete(oldest.value);
+  }
+}
+
 export class BrowserManager {
   /**
    * @param {{dataDir?: string|null, root?: string|null, env?: NodeJS.ProcessEnv, playwrightVersion?: string|null}} [options]
    */
   constructor(options = {}) {
     this.rt = resolveBrowserRuntime(options);
+    this.env = options.env || process.env;
+    this.managedSelections = new WeakMap();
     /** @type {Record<string, any>|null} */
     this.core = null;
     /** @type {string|null} Playwright runtime version when provided; falls back to core.__version / pin. */
     this.playwrightVersion = options.playwrightVersion || null;
-    /** @type {Map<string, BrowserSession>} */
+    /** @type {Map<string, TrackedBrowserSession>} */
     this.sessions = new Map();
     /** @type {Map<string, PWBrowser>} */
     this.managedBrowsers = new Map();
@@ -621,6 +666,32 @@ export class BrowserManager {
       playwright: BROWSER_RUNTIME_PIN.playwright,
       revision: expectedChromiumRevision(this.rt.coreDir)
     };
+  }
+
+  provider(headless = true) {
+    return resolveBrowserProvider({ coreDir: this.rt.coreDir, browsersDir: this.rt.browsersDir, headless, env: this.env });
+  }
+
+  /** @template T
+   * @param {boolean} headless
+   * @param {(selection: Awaited<ReturnType<typeof resolveBrowserProvider>>) => Promise<T>} launch
+   */
+  async launchSelected(headless, launch) {
+    const selected = await this.provider(headless);
+    const attempt = selection => {
+      if (!selection.ok || !selection.executablePath) {
+        scheduleConvergenceRetry({ base: this.rt.base });
+        throw Object.assign(new Error('BROWSER_INSTALLATION_MISSING'), {
+          detail: { tried: selection.tried, browsersDir: this.rt.browsersDir }
+        });
+      }
+      return launch(selection);
+    };
+    try { return await attempt(selected); } catch (error) {
+      if (!selected.installed || providerPolicyError(error)) throw error;
+      rejectInstalledBrowser(selected.executablePath);
+      return attempt(await this.provider(headless));
+    }
   }
 
   /**
@@ -719,36 +790,33 @@ export class BrowserManager {
     // that truly need otherwise must document and gate it explicitly.
     // SYN-BRW-002: resolve the executable ourselves (deterministic fs check)
     // instead of trusting Playwright's process-global registry memoization.
-    const resolved = resolveChromiumExecutable({
-      browsersDir: this.rt.browsersDir,
-      headless: key === 'headless'
-    });
-    if (!resolved.ok || !resolved.executablePath) {
-      throw Object.assign(new Error('BROWSER_INSTALLATION_MISSING'), {
-        detail: { tried: resolved.tried, browsersDir: this.rt.browsersDir }
-      });
-    }
+    const env = browserLaunchEnv({ browsersDir: this.rt.browsersDir });
     let browser = null;
     try {
-      browser = await core.chromium.launch({
+      browser = await this.launchSelected(key === 'headless', async resolved => {
+      const launched = await core.chromium.launch({
         headless: key === 'headless',
         executablePath: resolved.executablePath,
         timeout: 60000,
-        env: browserLaunchEnv({ browsersDir: this.rt.browsersDir }),
+        env,
         args: launchArgs
+      });
+      this.managedSelections.set(launched, resolved);
+      return launched;
       });
     } catch (e) {
       const msg = e && typeof e === 'object' && 'message' in e ? String(e.message) : '';
+      if (/^BROWSER_[A-Z_]+/.test(msg)) throw e;
       if (/executable doesn't exist|Executable doesn't exist/i.test(msg))
         throw Object.assign(new Error('BROWSER_INSTALLATION_MISSING'), {
           cause: e,
-          detail: { tried: resolved.tried, browsersDir: this.rt.browsersDir }
+          detail: { browsersDir: this.rt.browsersDir }
         });
       throw Object.assign(new Error('BROWSER_LAUNCH_FAILED'), { cause: e });
     }
     try {
       browser.on('disconnected', () => {
-        this.managedBrowsers.delete(key);
+        if (this.managedBrowsers.get(key) === browser) this.managedBrowsers.delete(key);
         for (const s of this.sessions.values()) {
           if (s.browser === browser && s.state !== 'closed') s.state = 'lost';
         }
@@ -764,7 +832,11 @@ export class BrowserManager {
    */
   async createSession(id, options = {}) {
     const existing = this.sessions.get(id);
-    if (existing && existing.state !== 'closed' && existing.state !== 'lost') return existing;
+    // L01a-19: sessions stuck in closing/error never settle on their own;
+    // replacing them here (like closed/lost) instead of returning the dead
+    // record keeps createSession from wedging on a half-closed session.
+    if (existing && !['closed', 'lost', 'closing', 'error'].includes(existing.state))
+      return existing;
     if (existing) this.sessions.delete(id);
     const mode = String(options.mode || 'managed').toLowerCase();
     if (mode !== 'managed' && mode !== 'existing') throw new Error('BROWSER_UNSUPPORTED_MODE');
@@ -800,6 +872,12 @@ export class BrowserManager {
       try {
         await this.closeSession(id, 'create-failed');
       } catch {}
+      if (mode === 'managed' && !session.ownsBrowser && session.browser &&
+          ![...this.sessions.values()].some(s => s.browser === session.browser && !['closed', 'closing', 'error', 'lost'].includes(s.state))) {
+        const key = session.headless ? 'headless' : 'headed';
+        if (this.managedBrowsers.get(key) === session.browser) this.managedBrowsers.delete(key);
+        try { await session.browser.close(); } catch {}
+      }
       throw e;
     }
     return session;
@@ -819,26 +897,22 @@ export class BrowserManager {
       if (!/^[A-Za-z0-9_-]{1,64}$/.test(profileId)) throw new Error('BROWSER_POLICY_DENIED');
       if (this.profileLocks.has(profileId)) throw new Error('BROWSER_PROFILE_IN_USE');
       this.profileLocks.set(profileId, session.id);
-      const userDataDir = path.join(this.rt.profilesDir, profileId);
       ensureDir(this.rt.profilesDir);
       let context = null;
       try {
         const pwVersion =
           this.playwrightVersion || (core && core.__version) || BROWSER_RUNTIME_PIN.playwright;
         assertServiceWorkersBlockSupported(pwVersion);
-        const resolvedProfile = resolveChromiumExecutable({
-          browsersDir: this.rt.browsersDir,
-          headless: session.headless
-        });
-        if (!resolvedProfile.ok || !resolvedProfile.executablePath) {
-          throw Object.assign(new Error('BROWSER_INSTALLATION_MISSING'), {
-            detail: { tried: resolvedProfile.tried, browsersDir: this.rt.browsersDir }
-          });
-        }
-        context = await core.chromium.launchPersistentContext(userDataDir, {
+        const env = browserLaunchEnv({ browsersDir: this.rt.browsersDir });
+        context = await this.launchSelected(session.headless, resolvedProfile => {
+        const profileRoot = resolvedProfile.provider === 'managed' ? this.rt.profilesDir
+          : path.join(this.rt.profilesDir, '.providers', resolvedProfile.provider);
+        ensureDir(profileRoot);
+        const userDataDir = path.join(profileRoot, profileId);
+        return core.chromium.launchPersistentContext(userDataDir, {
           headless: session.headless,
           executablePath: resolvedProfile.executablePath,
-          env: browserLaunchEnv({ browsersDir: this.rt.browsersDir }),
+          env,
           viewport: session.viewport,
           ...(session.locale ? { locale: session.locale } : {}),
           ...(session.timezone ? { timezoneId: session.timezone } : {}),
@@ -848,6 +922,7 @@ export class BrowserManager {
           downloadsPath: session.downloadsDir || path.join(this.rt.downloadsDir, session.id),
           timeout: 60000,
           args: ['--no-first-run', '--no-default-browser-check', '--disable-dev-shm-usage']
+        });
         });
       } catch (e) {
         this.profileLocks.delete(profileId);
@@ -861,17 +936,18 @@ export class BrowserManager {
       session.ownsBrowser = true;
       if (session.browser) {
         try {
-          session.browser.on('disconnected', () => {
+          session.listen(session.browser, 'disconnected', () => {
             if (session.state !== 'closed') session.state = 'lost';
           });
         } catch {}
       }
       session.context = context;
     } else {
-      const browser = await this.managedBrowser({ headless: session.headless });
-      session.browser = browser;
       session.ownsBrowser = false;
       let context = null;
+      for (let attempt = 0; attempt < 2; attempt++) {
+      const browser = await this.managedBrowser({ headless: session.headless });
+      session.browser = browser;
       try {
         const pwVersion =
           this.playwrightVersion ||
@@ -887,10 +963,23 @@ export class BrowserManager {
           acceptDownloads: true,
           downloadsPath: session.downloadsDir || path.join(this.rt.downloadsDir, session.id)
         });
+        break;
       } catch (e) {
+        const inUse = [...this.sessions.values()].some(s => s !== session && s.browser === browser && !['closed', 'closing', 'error', 'lost'].includes(s.state));
+        const selected = this.managedSelections.get(browser);
+        let cleaned = true;
+        if (!inUse) {
+          this.managedBrowsers.delete(session.headless ? 'headless' : 'headed');
+          try { await browser.close(); } catch { cleaned = false; }
+        }
+        if (attempt === 0 && !inUse && cleaned && selected?.installed && !providerPolicyError(e)) {
+          rejectInstalledBrowser(selected.executablePath);
+          continue;
+        }
         const msg = e && typeof e === 'object' && 'message' in e ? String(e.message) : '';
         if (/^BROWSER_[A-Z_]+/.test(msg)) throw e;
         throw Object.assign(new Error('BROWSER_LAUNCH_FAILED'), { cause: e });
+      }
       }
       session.context = context;
     }
@@ -933,21 +1022,14 @@ export class BrowserManager {
       throw new Error('BROWSER_EXISTING_ATTACH_FAILED');
     }
     try {
-      browser.on('disconnected', () => {
+      session.listen(browser, 'disconnected', () => {
         if (session.state !== 'closed') session.state = 'lost';
       });
     } catch {}
     session.downloadsDir = session.downloadsDir || path.join(this.rt.downloadsDir, session.id);
     ensureDir(session.downloadsDir);
     if (!session.context) throw new Error('BROWSER_EXISTING_ATTACH_FAILED');
-    try {
-      await this.wireContext(session, session.context);
-    } catch (e) {
-      try {
-        if (browser && typeof browser.close === 'function') await browser.close();
-      } catch {}
-      throw e;
-    }
+    await this.wireContext(session, session.context);
     const pages = typeof session.context.pages === 'function' ? session.context.pages() : [];
     if (pages.length === 0) await this.newPage(session, null);
     else {
@@ -956,7 +1038,7 @@ export class BrowserManager {
   }
 
   /**
-   * @param {BrowserSession} session
+   * @param {TrackedBrowserSession} session
    * @param {PWBContext} context
    */
   async wireContext(session, context) {
@@ -964,11 +1046,17 @@ export class BrowserManager {
     try {
       await installContextEgressFilter(context, session);
     } catch (e) {
-      try {
-        if (typeof context.close === 'function') await context.close();
-      } catch {}
+      if (session?.mode === 'existing') {
+        // closeSession removes this attachment's routes/listeners and CDP
+        // connection, not the operator's context or pre-existing pages.
+        try { await this.closeSession(session.id, 'egress-filter-failed'); } catch {}
+      } else {
+        try {
+          if (typeof context.close === 'function') await context.close();
+        } catch {}
+      }
       if (session) {
-        session.state = 'error';
+        if (session.state !== 'closed') session.state = 'error';
         if (session.ownsBrowser && session.browser && typeof session.browser.close === 'function') {
           try {
             await session.browser.close();
@@ -986,7 +1074,7 @@ export class BrowserManager {
       context.setDefaultNavigationTimeout(BROWSER_DEFAULTS.navigationTimeoutMs);
     } catch {}
     try {
-      context.on('console', (/** @type {Record<string, any>} */ msg) => {
+      session.listen(context, 'console', (/** @type {Record<string, any>} */ msg) => {
         try {
           const type = String((msg && msg.type && msg.type()) || 'log');
           const rank = CONSOLE_SEVERITY[type] !== undefined ? type : 'debug';
@@ -1007,10 +1095,21 @@ export class BrowserManager {
       });
     } catch {}
     const pending = new Map();
+    // L01a-5: expose the timing map so page/session close can drop it
+    // (entries keyed by dead request objects otherwise pin memory).
     try {
-      context.on('request', (/** @type {Record<string, any>} */ req) => {
+      session.pendingRequests = pending;
+    } catch {}
+    try {
+      session.listen(context, 'request', (/** @type {Record<string, any>} */ req) => {
         try {
           pending.set(req, Date.now());
+          capPendingTimings(pending);
+        } catch {}
+      });
+      session.listen(context, 'close', () => {
+        try {
+          pending.clear();
         } catch {}
       });
       const finish = (
@@ -1058,24 +1157,24 @@ export class BrowserManager {
             session.network.splice(0, session.network.length - BROWSER_DEFAULTS.maxNetworkEntries);
         } catch {}
       };
-      context.on('response', (/** @type {Record<string, any>} */ res) => {
+      session.listen(context, 'response', (/** @type {Record<string, any>} */ res) => {
         try {
           finish(res.request(), res.status(), false);
         } catch {}
       });
-      context.on('requestfailed', (/** @type {Record<string, any>} */ req) =>
+      session.listen(context, 'requestfailed', (/** @type {Record<string, any>} */ req) =>
         finish(req, null, true)
       );
     } catch {}
     try {
-      context.on('page', (/** @type {PWPage} */ page) => {
+      session.listen(context, 'page', (/** @type {PWPage} */ page) => {
         try {
           this.trackPage(session, page);
         } catch {}
       });
     } catch {}
     try {
-      context.on('dialog', (/** @type {PWDialog} */ dialog) => {
+      session.listen(context, 'dialog', (/** @type {PWDialog} */ dialog) => {
         try {
           const record = {
             type: (() => {
@@ -1119,32 +1218,48 @@ export class BrowserManager {
   }
 
   /**
-   * @param {BrowserSession} session
+   * @param {TrackedBrowserSession} session
    * @param {PWPage} page
+   * @param {boolean} [sessionCreated] true only for pages this session
+   * created via newPage (L01a-4): pre-existing operator tabs
+   * (existing-attach enumeration) and popup pages observed via the
+   * context `page` event must never be closed by closeSession — only
+   * session-created pages are.
    */
-  trackPage(session, page) {
+  trackPage(session, page, sessionCreated = false) {
     for (const [id, rec] of session.pages) {
       if (rec.page === page) {
+        if (sessionCreated === true) rec.sessionCreated = true;
         session.currentPageId = session.currentPageId || id;
         return id;
       }
     }
     const pageId = 'pg_' + crypto.randomBytes(6).toString('hex');
-    session.pages.set(pageId, { page, url: 'about:blank', title: '' });
+    session.pages.set(pageId, {
+      page,
+      url: 'about:blank',
+      title: '',
+      sessionCreated: sessionCreated === true
+    });
     if (!session.currentPageId) session.currentPageId = pageId;
+    const pageCleanups = [];
     try {
-      page.on('close', () => {
+      pageCleanups.push(session.listen(page, 'close', () => {
         try {
+          for (const cleanup of pageCleanups) cleanup();
           session.pages.delete(pageId);
           session.cdpSessions.delete(pageId);
           if (session.currentPageId === pageId) session.currentPageId = null;
+          // L01a-5: drop request timings with the page (keys are dead
+          // request objects; start-times fall back to Date.now()).
+          if (session.pendingRequests) session.pendingRequests.clear();
         } catch {}
-      });
+      }));
     } catch {}
     try {
-      page.on('download', (/** @type {PWDownload} */ dl) => {
+      pageCleanups.push(session.listen(page, 'download', (/** @type {PWDownload} */ dl) => {
         this.handleDownload(session, dl).catch(() => {});
-      });
+      }));
     } catch {}
     return pageId;
   }
@@ -1156,7 +1271,7 @@ export class BrowserManager {
   async newPage(session, url) {
     if (!session.context) throw new Error('BROWSER_SESSION_LOST');
     const page = await session.context.newPage();
-    const pageId = this.trackPage(session, page);
+    const pageId = this.trackPage(session, page, true);
     session.currentPageId = pageId;
     if (url) {
       try {
@@ -1225,6 +1340,11 @@ export class BrowserManager {
     if (session.state === 'closed') return { closed: true, existed: true, sessionId: session.id };
     const sessionId = session.id || id;
     session.state = 'closing';
+    if (Array.isArray(session.cleanups)) {
+      for (const cleanup of session.cleanups.splice(0).reverse()) {
+        try { await cleanup(); } catch {}
+      }
+    }
     if (session.pendingDialog?.timer) {
       try {
         clearTimeout(session.pendingDialog.timer);
@@ -1237,6 +1357,11 @@ export class BrowserManager {
       } catch {}
     }
     session.cdpSessions.clear();
+    // L01a-5: drop request timings with the session.
+    try {
+      if (session.pendingRequests) session.pendingRequests.clear();
+    } catch {}
+    session.pendingRequests = null;
     try {
       if (session.context) {
         if (session.mode === 'existing' || session.profileId) {
@@ -1244,13 +1369,19 @@ export class BrowserManager {
           // we created. Persistent profiles keep their browser alive.
           if (session.mode === 'existing') {
             for (const [, rec] of session.pages) {
+              // L01a-4: close ONLY session-created pages; pre-existing
+              // operator tabs stay open (the old loop closed them all).
+              if (rec.sessionCreated !== true) continue;
               try {
                 await rec.page.close();
               } catch {}
             }
             try {
               if (session.browser && session.browser.close) {
-                // Detach-only: Playwright closes CDP sessions it owns.
+                // connectOverCDP browser.close disconnects this client; it
+                // does not close the operator's browser. This also releases
+                // WebSocket route hooks, which have no public unroute API.
+                await session.browser.close();
               }
             } catch {}
           } else {
@@ -1545,7 +1676,10 @@ export class BrowserManager {
     const roleCounts = new Map();
     /** @type {Map<string, number>} */
     const namedCounts = new Map();
-    const maxDepth = options.depth || 0;
+    // L01a-9: depth 0/null/negative/NaN previously meant "unbounded" — a
+    // deep DOM tree then recursed without limit. Default to a 64-level cap.
+    const rawDepth = Number(options.depth);
+    const maxDepth = Number.isFinite(rawDepth) && rawDepth > 0 ? rawDepth : 64;
     /**
      * @param {Record<string, unknown>} node
      * @param {number} depth
@@ -1657,17 +1791,16 @@ export class BrowserManager {
       }
       let re = null;
       try {
-        // P3-D3: sync test() has no timeout; nested quantifiers backtrack
-        // exponentially and wedge the agent event loop. Reject structurally
-        // dangerous patterns before compiling (same fail-closed code).
+        // Multiline would let a start-anchored repeat retry at every line.
+        // Keep anchor semantics fixed and reject stateful/extended syntax.
+        if (!/^[iu]*$/.test(flags)) throw new Error('BROWSER_REGEX_REJECTED');
         re = new RegExp(assertSafeRegexPattern(pattern), flags);
       } catch {
         throw new Error('BROWSER_FIND_QUERY_REQUIRED');
       }
       matcher = (/** @type {string} */ line) => {
         const text = String(line || '');
-        // Bound per-attempt work for polynomial shapes: only the regex
-        // branch is sliced (literal includes() stays full-recall).
+        // Keep the existing regex input budget; literal includes() stays full-recall.
         return re.test(
           text.length > MAX_REGEX_TEST_CHARS ? text.slice(0, MAX_REGEX_TEST_CHARS) : text
         );
@@ -1725,10 +1858,10 @@ export class BrowserManager {
       let locator = null;
       if (TEXT_FALLBACK_ROLES.has(entry.role)) {
         if (!entry.name) throw new Error('BROWSER_TARGET_NOT_FOUND');
-        locator = page.getByText(entry.name).nth(entry.nameIndex);
+        locator = page.getByText(entry.name, { exact: true }).nth(entry.nameIndex);
       } else {
         locator = entry.name
-          ? page.getByRole(entry.role, { name: entry.name }).nth(entry.nameIndex)
+          ? page.getByRole(entry.role, { name: entry.name, exact: true }).nth(entry.nameIndex)
           : page.getByRole(entry.role).nth(entry.index);
       }
       try {
@@ -1761,6 +1894,11 @@ export class BrowserManager {
     } catch {}
     return { locator, pageId: options.pageId || session.currentPageId, backendNodeId };
   }
+}
+
+function providerPolicyError(error) {
+  const message = String(error?.message || '');
+  return /^BROWSER_/.test(message) && !/^BROWSER_(?:LAUNCH_FAILED|INSTALLATION_MISSING)$/.test(message);
 }
 
 /** @type {BrowserManager|null} */

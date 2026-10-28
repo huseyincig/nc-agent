@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 
 /**
  * @param {unknown} pid
@@ -72,7 +73,7 @@ export function defaultOwnerStartMs(pid, platform = process.platform) {
  * the old process must release before spawning, otherwise the child
  * dies with NC_CLIENT_ALREADY_RUNNING, no healthy marker ever lands,
  * and every OTA rolls back in a silent loop (posix fleet freeze).
- * @type {Map<string, () => Promise<void>>}
+ * @type {Map<string, {pid: number, raw: string, release: () => Promise<void>}>}
  */
 const heldLocks = new Map();
 
@@ -82,12 +83,56 @@ const heldLocks = new Map();
  * @param {string} lockFile
  */
 export async function releaseHeldLock(lockFile) {
-  const release = lockFile ? heldLocks.get(String(lockFile)) : null;
+  const release = lockFile ? heldLocks.get(String(lockFile))?.release : null;
   if (!release) return false;
   try {
     await release();
   } catch {}
   return true;
+}
+
+function alreadyRunning(owner = 0) {
+  return Object.assign(new Error('NC_CLIENT_ALREADY_RUNNING'), {
+    code: 'NC_CLIENT_ALREADY_RUNNING', owner_pid: owner
+  });
+}
+
+async function lockContent(lockFile) {
+  try {
+    return await fs.readFile(lockFile, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    // A partial write or read failure is not proof of a dead owner.
+    throw alreadyRunning();
+  }
+}
+
+function requireStaleOwner(raw, pidAlive, ownerStartMs) {
+  let row;
+  try { row = JSON.parse(raw); } catch { throw alreadyRunning(); }
+  if (!row || !Number.isInteger(row.pid) || row.pid < 2 ||
+      typeof row.started_at !== 'string' || !Number.isFinite(Date.parse(row.started_at))) {
+    throw alreadyRunning();
+  }
+  if (!pidAlive(row.pid)) return;
+  // Preserve the existing PID-reuse check, failing closed on unknown start time.
+  let ownerStart = null;
+  try { ownerStart = ownerStartMs(row.pid); } catch {}
+  if (ownerStart != null && ownerStart - Date.parse(row.started_at) > 5000) return;
+  throw alreadyRunning(row.pid);
+}
+
+async function acquireMutationGuard(lockFile) {
+  const guard = `${lockFile}.guard`;
+  try {
+    await fs.mkdir(guard, { mode: 0o700 });
+  } catch (error) {
+    if (error?.code === 'EEXIST') throw alreadyRunning();
+    throw error;
+  }
+  // Never reap this guard automatically: a crash must fail closed, not allow
+  // another mutator into a paused rename/create or release transaction.
+  return guard;
 }
 
 /**
@@ -105,57 +150,61 @@ export async function acquireClientLock({
 } = {}) {
   if (!lockFile) throw new Error('CLIENT_LOCK_PATH_REQUIRED');
   await fs.mkdir(path.dirname(lockFile), { recursive: true });
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const handle = await fs.open(lockFile, 'wx', 0o640);
-      await handle.writeFile(JSON.stringify({ pid, started_at: new Date().toISOString() }) + '\n');
-      await handle.close();
-      let released = false;
-      const release = async () => {
-        if (released) return;
-        released = true;
-        heldLocks.delete(String(lockFile));
-        try {
-          const row = JSON.parse(await fs.readFile(lockFile, 'utf8'));
-          if (Number(row.pid) === pid) await fs.rm(lockFile, { force: true });
-        } catch {}
-      };
-      heldLocks.set(String(lockFile), release);
-      return release;
-    } catch (error) {
-      const errorCode =
-        error && typeof error === 'object' && 'code' in error ? error.code : undefined;
-      if (errorCode !== 'EEXIST') throw error;
-      let owner = 0,
-        ownerClaimedAt = null;
+  const rawNow = await lockContent(lockFile);
+  const held = heldLocks.get(String(lockFile));
+  if (held?.pid === pid && held.raw === rawNow) throw alreadyRunning(pid);
+  if (rawNow !== null) requireStaleOwner(rawNow, pidAlive, ownerStartMs);
+  if (await lockContent(lockFile) !== rawNow) throw alreadyRunning();
+
+  // Rename alone is not compare-and-swap: a delayed contender could rename a
+  // fresh owner's file. Serialize ALL mutations (including create/release),
+  // then validate the optimistic snapshot again before quarantining anything.
+  const guard = await acquireMutationGuard(lockFile);
+  try {
+    if (await lockContent(lockFile) !== rawNow) throw alreadyRunning();
+    if (rawNow !== null) {
+      requireStaleOwner(rawNow, pidAlive, ownerStartMs);
+      const quarantine = path.join(guard, `stale-${randomUUID()}`);
+      await fs.rename(lockFile, quarantine);
       try {
-        const row = JSON.parse(await fs.readFile(lockFile, 'utf8'));
-        owner = Number(row.pid || 0);
-        ownerClaimedAt = typeof row.started_at === 'string' ? Date.parse(row.started_at) : null;
-      } catch {}
-      if (owner && pidAlive(owner)) {
-        // PID-reuse trap: the lock owner may be an unrelated recycled PID
-        // (unclean reboot). The true owner started before writing the lock;
-        // a process that started after the lock timestamp is an impostor.
-        let recycled = false;
-        if (Number.isFinite(ownerClaimedAt)) {
-          try {
-            const ownerStart = ownerStartMs(owner);
-            recycled =
-              ownerStart != null && ownerStart - /** @type {number} */ (ownerClaimedAt) > 5000;
-          } catch {}
-        }
-        if (!recycled) {
-          const e = /** @type {Error & {code?: string, owner_pid?: number}} */ (
-            new Error('NC_CLIENT_ALREADY_RUNNING')
-          );
-          e.code = 'NC_CLIENT_ALREADY_RUNNING';
-          e.owner_pid = owner;
-          throw e;
-        }
+        const renamed = await lockContent(quarantine);
+        if (renamed !== rawNow) throw alreadyRunning();
+        requireStaleOwner(renamed, pidAlive, ownerStartMs);
+      } catch (error) {
+        // Restore without overwriting an unexpected replacement. If restoration
+        // fails, retain quarantine + guard and fail closed for manual recovery.
+        await fs.link(quarantine, lockFile);
+        await fs.unlink(quarantine);
+        throw error;
       }
-      await fs.rm(lockFile, { force: true });
+      await fs.unlink(quarantine);
     }
+
+    const raw = JSON.stringify({
+      pid, started_at: new Date().toISOString(), lock_id: randomUUID()
+    }) + '\n';
+    const handle = await fs.open(lockFile, 'wx', 0o640);
+    try { await handle.writeFile(raw); } finally { await handle.close(); }
+    if (await lockContent(lockFile) !== raw) throw alreadyRunning();
+    let released = false;
+    const release = async () => {
+      if (released) return;
+      const releaseGuard = await acquireMutationGuard(lockFile);
+      try {
+        // Exact claim identity, not just PID: old releases cannot remove a
+        // later claim, even when the PID or timestamp has been reused.
+        if (await lockContent(lockFile) === raw) await fs.unlink(lockFile);
+        released = true;
+        if (heldLocks.get(String(lockFile))?.release === release) {
+          heldLocks.delete(String(lockFile));
+        }
+      } finally {
+        await fs.rmdir(releaseGuard);
+      }
+    };
+    heldLocks.set(String(lockFile), { pid, raw, release });
+    return release;
+  } finally {
+    await fs.rmdir(guard);
   }
-  throw new Error('CLIENT_LOCK_ACQUIRE_FAILED');
 }

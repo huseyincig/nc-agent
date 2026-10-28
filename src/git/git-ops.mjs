@@ -19,7 +19,7 @@ import path from 'node:path';
 import { realAllowed } from '../structured-ops/structured-ops.mjs';
 import { forbidAgentTreeWrite } from '../filesystem/mutation-ops.mjs';
 import { policyExtraRoots } from '../policy/host-policy.mjs';
-import { headTailTruncate } from '../client/shell-runner.mjs';
+import { filterInheritedEnv, headTailTruncate } from '../client/shell-runner.mjs';
 
 const run = promisify(execFile);
 const MAX_STATUS_ROWS = 500;
@@ -483,7 +483,7 @@ export async function findGitTop(start, raw = '') {
 }
 
 const GIT_WRITE_ACTIONS = Object.freeze(['add', 'commit', 'push', 'branch', 'fetch']);
-const GIT_REMOTE_RE = /^[A-Za-z0-9_.\-]{1,128}$/;
+const GIT_REMOTE_RE = /^[A-Za-z0-9_.][A-Za-z0-9_.\-]{0,127}$/;
 
 /**
  * @typedef {{action: 'add', paths: Array<string>}} GitWriteAdd
@@ -546,10 +546,10 @@ export function validateGitWriteArgs(p) {
   }
   if (action === 'push' || action === 'fetch') {
     const remote = String(rec.remote || 'origin');
-    if (!GIT_REMOTE_RE.test(remote))
+    if (!GIT_REMOTE_RE.test(remote) || remote === '.' || remote === '..')
       throw new Error(
         `INVALID_GIT_REMOTE: remote must be [A-Za-z0-9_.-]{1,128} (got '${remote.slice(0, 64)}'). ` +
-        `Do not retry with a URL or path here.`
+        `Do not retry with a URL, path or leading dash here.`
       );
     if (action === 'fetch') {
       let depth = null;
@@ -582,13 +582,14 @@ function gatedRepo(job, baseRoots, write = false) {
   if (!raw || raw.length > 4096) throw new Error('INVALID_PATH');
   const extra = policyExtraRoots(job);
   const roots = [...baseRoots, ...(write ? extra.write : extra.read)];
+  const authorizeRepo = (target) => realAllowed(target, roots, extra.allowAll === true);
   // Missing directories surface here as bare ENOENT: translate to the
   // terminal GIT_PATH_NOT_FOUND family (with the /opt/hhc legacy hint)
   // so the model never retries a path that cannot exist.
   const repoPromise = realAllowed(raw, roots, extra.allowAll === true).catch((e) => {
     throw gateError(raw, e);
   });
-  return { repoPromise, params: p };
+  return { repoPromise, params: p, authorizeRepo };
 }
 
 /**
@@ -599,17 +600,19 @@ function gatedRepo(job, baseRoots, write = false) {
  * @param {string|null} [options.workspace]
  */
 export function makeGitHandlers({ readRoots = [], writeRoots = [], appRoot = null, workspace = null } = {}) {
-  const preflight = async (repo, raw) => {
+  const preflight = async (repo, raw, authorizeRepo, write = false) => {
     // Walk first (no shell), pin the discovered top, confirm with git.
-    const walked = await findGitTop(repo, raw);
+    const walked = await authorizeRepo(await findGitTop(repo, raw));
+    if (write) forbidAgentTreeWrite('git_write', [walked], { appRoot, workspace });
     try {
       const { stdout } = await run(
         'git',
         ['-c', `safe.directory=${walked}`, 'rev-parse', '--show-toplevel'],
-        { timeout: 15000, cwd: walked, env: { ...process.env, ...GIT_ENV } }
+        { timeout: 15000, cwd: walked, env: { ...filterInheritedEnv(), ...GIT_ENV } }
       );
-      const top = String(stdout || '').trim();
-      return top || walked;
+      const top = await authorizeRepo(String(stdout || '').trim() || walked);
+      if (write) forbidAgentTreeWrite('git_write', [top], { appRoot, workspace });
+      return top;
     } catch (e) {
       gitOrThrow(e, { repo: walked, raw });
       throw e;
@@ -622,7 +625,7 @@ export function makeGitHandlers({ readRoots = [], writeRoots = [], appRoot = nul
       return await run('git', ['-c', `safe.directory=${repo}`, ...args], {
         timeout,
         cwd: repo,
-        env: { ...process.env, ...GIT_ENV }
+        env: { ...filterInheritedEnv(), ...GIT_ENV }
       });
     } catch (e) {
       gitOrThrow(e, { repo, raw });
@@ -632,12 +635,12 @@ export function makeGitHandlers({ readRoots = [], writeRoots = [], appRoot = nul
   return {
     git_status: async (job) => {
       try {
-        const { repoPromise, params } = gatedRepo(job, readRoots);
+        const { repoPromise, params, authorizeRepo } = gatedRepo(job, readRoots);
         const raw = String(params.path || '');
         const repo = await repoPromise;
         // Pre-flight first: a non-repo/missing/foreign-owned dir fails here
         // with the terminal family, never as a bare code from status.
-        const top = await preflight(repo, raw);
+        const top = await preflight(repo, raw, authorizeRepo);
         const { stdout } = await git(top, ['status', '--porcelain=v1', '--branch', '-uall'], 30000, raw);
         const parsed = parseGitStatus(stdout);
         const truncated = parsed.total_entries > parsed.entries.length;
@@ -655,16 +658,17 @@ export function makeGitHandlers({ readRoots = [], writeRoots = [], appRoot = nul
     },
     git_log: async (job) => {
       try {
-        const { repoPromise, params } = gatedRepo(job, readRoots);
-        const raw = String(params.path || '');
+        const params = (job && (job.request_payload || job.payload)) || {};
         // Validate before any spawn: a leading-dash branch must fail as
         // INVALID_BRANCH even when the path would fail pre-flight too.
         const lim =
           params.limit == null ? 20 : Math.max(1, Math.min(MAX_LINES, Number(params.limit) || 20));
         const branch = typeof params.branch === 'string' && params.branch ? params.branch : null;
         if (branch && !BRANCH_RE.test(branch)) throw new Error('INVALID_BRANCH');
+        const { repoPromise, authorizeRepo } = gatedRepo(job, readRoots);
+        const raw = String(params.path || '');
         const repo = await repoPromise;
-        const top = await preflight(repo, raw);
+        const top = await preflight(repo, raw, authorizeRepo);
         const args = [
           'log',
           `--format=%H%x1f%an%x1f%ad%x1f%s`,
@@ -681,10 +685,10 @@ export function makeGitHandlers({ readRoots = [], writeRoots = [], appRoot = nul
     },
     git_diff: async (job) => {
       try {
-        const { repoPromise, params } = gatedRepo(job, readRoots);
+        const { repoPromise, params, authorizeRepo } = gatedRepo(job, readRoots);
         const raw = String(params.path || '');
         const repo = await repoPromise;
-        const top = await preflight(repo, raw);
+        const top = await preflight(repo, raw, authorizeRepo);
         const staged = params.staged === true;
         const statOnly = params.stat_only !== false;
         const args = statOnly
@@ -741,10 +745,10 @@ export function makeGitHandlers({ readRoots = [], writeRoots = [], appRoot = nul
     },
     git_branch: async (job) => {
       try {
-        const { repoPromise, params } = gatedRepo(job, readRoots);
+        const { repoPromise, params, authorizeRepo } = gatedRepo(job, readRoots);
         const raw = String(params.path || '');
         const repo = await repoPromise;
-        const top = await preflight(repo, raw);
+        const top = await preflight(repo, raw, authorizeRepo);
         const cur = await git(top, ['branch', '--show-current'], 15000, raw);
         const all = await git(top, ['branch', '--format=%(refname:short)', '--list'], 15000, raw);
         return ok({ platform: process.platform, path: top, ...parseGitBranches(cur.stdout, all.stdout) });
@@ -779,7 +783,7 @@ export function makeGitHandlers({ readRoots = [], writeRoots = [], appRoot = nul
           await run('git', args, {
             timeout: 600000,
             maxBuffer: 8 * 1024 * 1024,
-            env: { ...process.env, ...GIT_ENV }
+            env: { ...filterInheritedEnv(), ...GIT_ENV }
           });
         } catch (e) {
           gitOrThrow(e, { repo: target, raw: target });
@@ -803,13 +807,23 @@ export function makeGitHandlers({ readRoots = [], writeRoots = [], appRoot = nul
         // spawn, even when the path would fail pre-flight too.
         const v = validateGitWriteArgs(p);
         const { action } = v;
-        const { repoPromise, params } = gatedRepo(job, writeRoots, true);
+        const { repoPromise, params, authorizeRepo } = gatedRepo(job, writeRoots, true);
         const raw = String(params.path || '');
         const repo = await repoPromise;
         forbidAgentTreeWrite('git_write', [repo], { appRoot, workspace });
-        const top = await preflight(repo, raw);
+        const top = await preflight(repo, raw, authorizeRepo, true);
         const g = (args, timeout) => git(top, args, timeout, raw);
         const base = { platform: process.platform, path: top, action };
+        if (v.action === 'push' || v.action === 'fetch') {
+          // Git also accepts local paths here: only configured names may reach
+          // push/fetch, never a syntactically valid relative-directory fallback.
+          const { stdout } = await g(['remote'], 15000);
+          if (!String(stdout || '').split(/\r?\n/).includes(v.remote))
+            throw new Error(
+              `INVALID_GIT_REMOTE: remote '${v.remote}' is not configured in this repository. ` +
+              `Use an existing configured remote name, not a URL or path.`
+            );
+        }
         // Narrow on v.action (not the destructured copy) so TS refines
         // the validated-args union per branch.
         if (v.action === 'add') {
@@ -831,7 +845,7 @@ export function makeGitHandlers({ readRoots = [], writeRoots = [], appRoot = nul
             await run(
               'git',
               ['-c', `safe.directory=${top}`, 'diff', '--cached', '--quiet'],
-              { timeout: 15000, cwd: top, env: { ...process.env, ...GIT_ENV } }
+              { timeout: 15000, cwd: top, env: { ...filterInheritedEnv(), ...GIT_ENV } }
             );
             probe = 'empty';
           } catch (e) {

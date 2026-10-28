@@ -49,6 +49,21 @@ async function openNoFollow(target, numericFlags, fallbackFlag, mode = 0o640, fs
       throw new Error('UPDATE_TAR_PATH_ESCAPE', { cause: openError });
     }
     if ((code === 'EINVAL' || code === 'ENOSYS' || code === 'EOPNOTSUPP') && fsConstants.O_NOFOLLOW) {
+      // L01b-10: the fallback drops O_NOFOLLOW, so re-lstat and refuse
+      // symlinks before retrying — otherwise a link planted after the
+      // pre-check sails through the fallback open.
+      try {
+        const rst = await fsApi.lstat(target);
+        if (rst && rst.isSymbolicLink()) throw new Error('UPDATE_TAR_PATH_ESCAPE', { cause: openError });
+      } catch (lstatError) {
+        const lcode = /** @type {NodeJS.ErrnoException} */ (lstatError)?.code;
+        if (lcode === 'ELOOP' || lcode === 'EMLINK')
+          throw new Error('UPDATE_TAR_PATH_ESCAPE', { cause: lstatError });
+        if (lstatError instanceof Error && lstatError.message === 'UPDATE_TAR_PATH_ESCAPE')
+          throw lstatError;
+        // ENOENT (fresh file) and other lstat failures: fall through to
+        // the fallback open, which surfaces the authoritative verdict.
+      }
       return await fsApi.open(target, fallbackFlag, mode);
     }
     throw openError;

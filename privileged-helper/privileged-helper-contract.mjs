@@ -12,7 +12,9 @@ export const PRIVILEGED_HELPER_OPERATIONS = Object.freeze([
   'compose_control',
   'package_control',
   'system_log_read',
-  'file_permissions'
+  'file_permissions',
+  'file_read',
+  'file_write'
 ]);
 export const PRIVILEGED_HELPER_ERRORS = Object.freeze([
   'PRIVILEGED_HELPER_NOT_AVAILABLE',
@@ -190,6 +192,23 @@ function expectedPrivilegeBinding(request) {
     // Wording must stay semantically identical to the central/client copy.
     return (
       ['mcp', 'admin_api'].includes(/** @type {string} */ (req.admission_origin)) &&
+      (sameArray(required, ['file_write', 'privileged_exec']) ||
+        sameArray(required, ['directory_manage', 'file_write', 'privileged_exec']))
+    );
+  }
+  if (req.operation === 'file_read') {
+    // Bounded file read via privileged helper.
+    // Gated on file_read + privileged_exec capabilities.
+    return (
+      ['mcp', 'admin_api', 'system'].includes(/** @type {string} */ (req.admission_origin)) &&
+      sameArray(required, ['file_read', 'privileged_exec'])
+    );
+  }
+  if (req.operation === 'file_write') {
+    // Bounded file mutation via privileged helper.
+    // Gated on file_write + privileged_exec capabilities, plus directory_manage when managing directories.
+    return (
+      ['mcp', 'admin_api', 'system'].includes(/** @type {string} */ (req.admission_origin)) &&
       (sameArray(required, ['file_write', 'privileged_exec']) ||
         sameArray(required, ['directory_manage', 'file_write', 'privileged_exec']))
     );

@@ -15,7 +15,8 @@ import path from 'node:path';
 import { realAllowed } from './structured-ops.mjs';
 import { forbidAgentTreeWrite } from '../filesystem/mutation-ops.mjs';
 import { policyExtraRoots } from '../policy/host-policy.mjs';
-import { terminateSessionTree, terminateSessionTreeAsync } from '../process/process-sessions.mjs';
+import { captureSpawnIdentity, terminateSessionTree, terminateSessionTreeAsync } from '../process/process-sessions.mjs';
+import { shellEnvironment } from '../client/shell-runner.mjs';
 
 const run = promisify(execFile);
 const MAX_TASKS = 200;
@@ -517,26 +518,46 @@ export function makeProjectHandlers({ readRoots = [], writeRoots = [], appRoot =
       let stdout = '';
       let stderr = '';
       let settled = false;
+      let stopping = false;
+      let stdoutTruncated = false;
+      let stderrTruncated = false;
       let wasCancelled = false;
+      let timedOut = false;
+      let exitCode = null;
+      let forceTimer = null;
+      let fallbackTimer = null;
       let child = null;
+      /** @type {ReturnType<typeof captureSpawnIdentity>} */
+      let taskIdentity = null;
       const key = abortKey != null && abortKey !== '' ? String(abortKey) : null;
       const finish = (code, extra) => {
         if (settled) return;
         settled = true;
+        clearTimeout(timer);
+        clearTimeout(forceTimer);
+        clearTimeout(fallbackTimer);
         if (key) taskAbortByJob.delete(key);
+        // A bounded fallback must also release our pipe handles. Signalling
+        // remains exclusively behind the spawn-identity-verified tree kill.
+        if (stopping) {
+          child?.stdin?.destroy?.();
+          child?.stdout?.destroy?.();
+          child?.stderr?.destroy?.();
+        }
         resolve({
-          exit_code: typeof code === 'number' ? code : null,
+          exit_code: typeof code === 'number' ? code : exitCode,
           stdout,
           stderr: stderr.slice(-4096),
-          stdout_truncated: stdout.length >= MAX,
-          stderr_truncated: stderr.length > 4096,
+          stdout_truncated: stdoutTruncated || stdout.length >= MAX,
+          stderr_truncated: stderrTruncated || stderr.length > 4096,
           cancelled: wasCancelled,
           duration_ms: Date.now() - started,
+          ...(timedOut ? { timed_out: true } : {}),
           ...(extra || {})
         });
       };
       // P2-05b: verified tree-kill (PID-reuse guard). Threads the spawn-time
-      // identity (started_at + argv entrypoint); the pre-verify inside
+      // identity (kernel identity + started_at + argv entrypoint); the pre-verify inside
       // terminateSessionTreeAsync fails closed (skipped-unverified, no
       // signal) instead of blind-killing a possibly-recycled PID/group.
       // Residual: an unverifiable PID is left running (finish still settles
@@ -556,33 +577,46 @@ export function makeProjectHandlers({ readRoots = [], writeRoots = [], appRoot =
           graceMs: force ? 0 : 1500,
           expectedStartedAt: taskStartedAt,
           expectedPath: taskExe,
-          expectedCommandLine: taskArgList
+          expectedCommandLine: taskArgList,
+          expectedIdentity: taskIdentity
         }).catch(() => {});
       };
       if (key) {
         taskAbortByJob.set(key, () => {
           wasCancelled = true;
+          if (stopping) return;
+          stopping = true;
+          clearTimeout(timer);
           killTree(false);
-          setTimeout(() => killTree(true), 1500).unref?.();
+          forceTimer = setTimeout(() => killTree(true), 1500);
+          forceTimer.unref?.();
           // Hard fallback: an unkillable tree (D-state, pid reuse race)
           // must not wedge the op forever; hub timeouts bound the wait.
-          setTimeout(() => finish(null, { cancelled: true }), 10000).unref?.();
+          fallbackTimer = setTimeout(() => finish(null, { cancelled: true }), 10000);
+          fallbackTimer.unref?.();
         });
       }
       const timer = setTimeout(() => {
+        timedOut = true;
+        stopping = true;
         killTree(false);
-        setTimeout(() => {
+        forceTimer = setTimeout(() => {
           killTree(true);
-          // Escalation runs BEFORE finish: the earlier shape settled first
-          // and neutered SIGKILL into a no-op.
-          finish(null, { timed_out: true });
-        }, 1500).unref?.();
+          // Requesting force is not evidence of close. Allow a bounded
+          // stdio-drain window before the last-resort pipe cleanup.
+          fallbackTimer = setTimeout(() => finish(null, { timed_out: true }), 1000);
+          fallbackTimer.unref?.();
+        }, 1500);
+        forceTimer.unref?.();
       }, Math.max(1, timeoutMs));
       if (timer.unref) timer.unref();
       try {
         child = spawn(argv[0], argv.slice(1), {
           cwd: repo,
-          env: { ...process.env, ...RUN_ENV },
+          // L01b-2: route through the filterInheritedEnv choke point
+          // (shellEnvironment) so host secrets (GITHUB_TOKEN/AWS_*) never
+          // reach repo task scripts. RUN_ENV applies on top (own values).
+          env: { ...shellEnvironment(), ...RUN_ENV },
           windowsHide: true,
           // Detached group leader (posix): tree-kill via kill(-pid) takes
           // npm/sh/pytest grandchildren together so stdio pipes close and
@@ -590,6 +624,7 @@ export function makeProjectHandlers({ readRoots = [], writeRoots = [], appRoot =
           // pipes and cancellation never settles.
           detached: process.platform !== 'win32'
         });
+        taskIdentity = captureSpawnIdentity(child);
       } catch (e) {
         clearTimeout(timer);
         finish(null, { spawn_error: String((e && e.message) || e || '') });
@@ -599,23 +634,46 @@ export function makeProjectHandlers({ readRoots = [], writeRoots = [], appRoot =
         clearTimeout(timer);
         finish(null, { spawn_error: 'SPAWN_FAILED' });
       });
+      child.on('exit', (code) => {
+        if (typeof code === 'number') exitCode = code;
+      });
       // Overflow: same escalate-then-finish as timeout (a surviving
       // tree must not wedge the op: SIGTERM, then SIGKILL, then settle).
       const overflow = () => {
+        if (settled || stopping) return;
+        stopping = true;
         clearTimeout(timer);
         killTree(false);
-        setTimeout(() => {
+        forceTimer = setTimeout(() => {
           killTree(true);
-          finish(null, {});
-        }, 1500).unref?.();
+          fallbackTimer = setTimeout(() => finish(null, {}), 1000);
+          fallbackTimer.unref?.();
+        }, 1500);
+        forceTimer.unref?.();
       };
       child.stdout?.on('data', (d) => {
-        stdout += String(d || '');
-        if (stdout.length + stderr.length >= MAX) overflow();
+        if (settled) return;
+        if (stopping) {
+          stdoutTruncated = true;
+          return;
+        }
+        stdout += String(d || '').slice(0, MAX - stdout.length - stderr.length);
+        if (stdout.length + stderr.length >= MAX) {
+          stdoutTruncated = true;
+          overflow();
+        }
       });
       child.stderr?.on('data', (d) => {
-        stderr += String(d || '');
-        if (stdout.length + stderr.length >= MAX) overflow();
+        if (settled) return;
+        if (stopping) {
+          stderrTruncated = true;
+          return;
+        }
+        stderr += String(d || '').slice(0, MAX - stdout.length - stderr.length);
+        if (stdout.length + stderr.length >= MAX) {
+          stderrTruncated = true;
+          overflow();
+        }
       });
       child.on('close', (code) => {
         clearTimeout(timer);
@@ -683,7 +741,7 @@ export function makeProjectHandlers({ readRoots = [], writeRoots = [], appRoot =
             runner: owners[0],
             task: name,
             ...r,
-            truncated: r.stdout.length >= 8 * 1024 * 1024
+            truncated: r.stdout_truncated || r.stderr_truncated
           });
         }
         const argv = await resolveTask(repo, runner, name);
@@ -695,7 +753,7 @@ export function makeProjectHandlers({ readRoots = [], writeRoots = [], appRoot =
           runner: runner.toLowerCase(),
           task: name,
           ...r,
-          truncated: r.stdout.length >= 8 * 1024 * 1024
+          truncated: r.stdout_truncated || r.stderr_truncated
         });
       } catch (e) {
         return fail(e && e.message ? e.message : 'PROJECT_OP_FAILED');

@@ -52,19 +52,101 @@ export function killSpawnTree(child, platform = process.platform, force = false,
 }
 
 /**
+ * Bounded single-PID Windows identity query (R-C2: mirrors
+ * queryWindowsProcessIdentity in process-sessions.mjs). `Get-CimInstance
+ * -Filter 'ProcessId = N'` addresses ONE instance — no WMI enumeration.
+ * Emits a single compressed-JSON row `{StartTime, Path}`; empty/missing
+ * output or any failure → null (unknown, never guessed). Self-contained:
+ * this module runs in the privileged helper daemon and must not import
+ * the agent's session table.
+ * @param {number} pid
+ * @param {{execFile?: any}} [options] injectable for deterministic tests
+ * @returns {Promise<{startTimeMs: number, path: string|null}|null>}
+ */
+export async function queryWindowsProcessIdentity(pid, { execFile = null } = {}) {
+  const safePid = Math.floor(Number(pid));
+  if (!Number.isInteger(safePid) || safePid < 2 || safePid > 4194304) return null;
+  try {
+    const { execFile: ef } = execFile || (await import('node:child_process'));
+    const { promisify } = await import('node:util');
+    const run = promisify(ef);
+    const { stdout } = await run(
+      'powershell',
+      [
+        '-NoProfile',
+        '-Command',
+        `$p = Get-CimInstance Win32_Process -Filter 'ProcessId = ${safePid}'; ` +
+          `if ($p) { [pscustomobject]@{ StartTime = $p.CreationDate.ToUniversalTime().ToString('o'); ` +
+          `Path = $p.ExecutablePath } | ConvertTo-Json -Compress }`
+      ],
+      { timeout: 10000 }
+    );
+    const text = String(stdout || '').trim();
+    if (!text || text === 'null') return null;
+    const row = JSON.parse(text);
+    const startTimeMs = Date.parse(String(row?.StartTime || ''));
+    if (!Number.isFinite(startTimeMs)) return null;
+    return {
+      startTimeMs,
+      path: typeof row?.Path === 'string' && row.Path ? row.Path : null
+    };
+  } catch {
+    return null;
+  }
+}
+/**
+ * Case-insensitive Windows path equality (the Win32 namespace is
+ * case-insensitive, so `C:/x/NODE.EXE` === `c:\\x\\node.exe`).
+ * @param {string} actual
+ * @param {string} expected
+ */
+export function windowsPathEquals(actual, expected) {
+  const norm = (v) => String(v || '').replace(/\//g, '\\').toLowerCase();
+  return norm(actual) === norm(expected);
+}
+/**
+ * Multi-attribute Windows process identity (R-C2: mirrors
+ * verifyWindowsProcessIdentity in process-sessions.mjs). Time AND path
+ * (when an expectation is supplied): a start time inside the tolerance
+ * window can collide with an unrelated recycled process, so time alone
+ * must never authorize a signal. Fail-closed tri-state: query
+ * failed/gone/unparseable → null; time outside tolerance → false;
+ * expected path supplied but live path missing → null; mismatch → false.
+ * @param {number} pid
+ * @param {{startedAtIso?: unknown, path?: unknown}} [expected]
+ * @param {{execFile?: any}} [options] injectable for deterministic tests
+ * @returns {Promise<boolean|null>}
+ */
+export async function verifyWindowsProcessIdentity(
+  pid,
+  { startedAtIso = null, path = null } = {},
+  { execFile = null } = {}
+) {
+  const expected = Date.parse(String(startedAtIso || ''));
+  if (!Number.isFinite(expected)) return null;
+  const ident = await queryWindowsProcessIdentity(pid, { execFile });
+  if (!ident) return null;
+  if (Math.abs(ident.startTimeMs - expected) > SWEEP_VERIFY_TOLERANCE_MS) return false;
+  if (path !== null && path !== undefined && String(path) !== '') {
+    if (!ident.path) return null;
+    if (!windowsPathEquals(ident.path, String(path))) return false;
+  }
+  return true;
+}
+/**
  * P2-04: probe whether a detached POSIX process GROUP is still alive before
  * a deferred group SIGKILL. Re-verifies PGID identity against the recorded
  * start time before authorizing the signal to prevent PID-reuse races.
  * If unverifiable, skips signal (fail-safe).
  * @param {number|undefined|null} pid group-leader pid (pgid == pid when detached)
  * @param {string|number} [startedAtIso] expected process/group start time ISO
- * @param {{platform?: string}} [options]
- * @returns {Promise<boolean>|boolean} true unless the group is provably gone or identity mismatch
+ * @param {{platform?: string, execFile?: any, expectedPath?: unknown}} [options]
+ * @returns {Promise<boolean|null>}
  */
 export async function verifyProcessStartTime(
   pid,
   startedAtIso,
-  { platform = process.platform, execFile = null } = {}
+  { platform = /** @type {string} */ (process.platform), execFile = null, expectedPath = null } = {}
 ) {
   const expected = Date.parse(String(startedAtIso || ''));
   if (!Number.isFinite(expected)) return null;
@@ -89,7 +171,14 @@ export async function verifyProcessStartTime(
       const actualMs = (btime + ticks / ticksPerSec) * 1000;
       return Math.abs(actualMs - expected) <= SWEEP_VERIFY_TOLERANCE_MS;
     }
-    if (platform === 'win32') return null;
+    if (platform === 'win32') {
+      // R-C2: multi-attribute identity (never time-only, never null-bypass).
+      return await verifyWindowsProcessIdentity(
+        pid,
+        { startedAtIso, path: expectedPath },
+        { execFile }
+      );
+    }
     const { execFile: ef } = execFile || (await import('node:child_process'));
     const { promisify } = await import('node:util');
     const run = promisify(ef);
@@ -104,10 +193,16 @@ export async function verifyProcessStartTime(
   }
 }
 
+/**
+ * @param {number|undefined|null} pid group-leader pid
+ * @param {string|number} [startedAtIso] expected start time
+ * @param {{platform?: string, execFile?: any}} [options]
+ * @returns {Promise<boolean|null>}
+ */
 export async function verifyPgidIdentity(
   pid,
   startedAtIso,
-  { platform = process.platform, execFile = null } = {}
+  { platform = /** @type {string} */ (process.platform), execFile = null } = {}
 ) {
   const id = Math.floor(Number(pid));
   if (!Number.isInteger(id) || id < 2) return false;
@@ -151,7 +246,13 @@ export async function verifyPgidIdentity(
   return false;
 }
 
-export async function groupAlive(pid, startedAtIso, { platform = process.platform } = {}) {
+/**
+ * @param {number|undefined|null} pid group-leader pid
+ * @param {string|number} [startedAtIso] expected start time
+ * @param {{platform?: string}} [options]
+ * @returns {Promise<boolean>}
+ */
+export async function groupAlive(pid, startedAtIso, { platform = /** @type {string} */ (process.platform) } = {}) {
   const id = Math.floor(Number(pid));
   if (!Number.isInteger(id) || id < 2) return false;
   let alive = false;
@@ -291,13 +392,51 @@ export function runPrivilegedCapture(cmd, args, {
     };
     const timer = setTimeout(() => {
       // Watchdog: resolve NOW (never wait for `close` — orphaned pipe
-      // holders must not hang the daemon), escalate the kill in background.
+      // holders must not hang the daemon), verify + escalate the kill in
+      // background.
       if (settled) return;
       settled = true;
       const note = `${cmd} timed out after ${Math.round(timeout / 1000)}s`;
+      const snapStdout = stdout.trim();
+      const snapStderr = stderr.trim();
+      const snapOut = out.trim() || note;
       try {
-        killSpawnTree(child, platform, false, tree);
+        child.stdout?.destroy();
       } catch {}
+      try {
+        child.stderr?.destroy();
+      } catch {}
+      resolve({
+        code: null,
+        stdout: snapStdout,
+        stderr: snapStderr,
+        out: snapOut,
+        error: null,
+        timedOut: true,
+        stdoutTruncated,
+        stderrTruncated
+      });
+      // R-C2: verify identity BEFORE the initial gentle kill (fail
+      // closed: an unverifiable PID — possibly recycled after our child
+      // exited — receives no signal). The escalation below re-verifies
+      // itself before SIGKILL with the same discipline.
+      void (async () => {
+        try {
+          let verified = false;
+          try {
+            verified = groupKill
+              ? await groupAlive(child?.pid, startedAtIso, { platform })
+              : (await verifyProcessStartTime(child?.pid, startedAtIso, { platform })) === true;
+          } catch {
+            verified = false;
+          }
+          if (verified) {
+            try {
+              killSpawnTree(child, platform, false, tree);
+            } catch {}
+          }
+        } catch {}
+      })();
       escalate = setTimeout(async () => {
         try {
           // Re-verify PGID identity before group SIGKILL (PID-reuse safety).
@@ -306,7 +445,8 @@ export function runPrivilegedCapture(cmd, args, {
             const isAlive = await groupAlive(child?.pid, startedAtIso, { platform });
             if (isAlive) killSpawnTree(child, platform, true, tree);
           } else {
-            killSpawnTree(child, platform, true, tree);
+            const isAlive = await verifyProcessStartTime(child?.pid, startedAtIso, { platform });
+            if (isAlive === true) killSpawnTree(child, platform, true, tree);
           }
         } catch {}
         try {
@@ -317,16 +457,6 @@ export function runPrivilegedCapture(cmd, args, {
         } catch {}
       }, grace);
       unrefTimer(escalate);
-      resolve({
-        code: null,
-        stdout: stdout.trim(),
-        stderr: stderr.trim(),
-        out: out.trim() || note,
-        error: null,
-        timedOut: true,
-        stdoutTruncated,
-        stderrTruncated
-      });
     }, timeout);
     unrefTimer(timer);
     child.stdout?.on('data', (d) => push(d, 0));

@@ -2,22 +2,19 @@ import { execFileSync, spawn as nodeSpawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { runtimeRoot } from './nc-paths.mjs';
 /** Data-dir uninstall transcript shared by the handler (sync) and the detached trigger (async). */
-function triggerLogPath() {
+function triggerLogPath(root = runtimeRoot()) {
   try {
-    if (process.platform === 'win32') {
-      const base = process.env.ProgramData || 'C:\\ProgramData';
-      return path.join(base, 'NC', 'data', 'uninstall-trigger.log');
-    }
-    return '/opt/nc/data/uninstall-trigger.log';
+    return path.join(root, 'data', 'uninstall-trigger.log');
   } catch {
     return null;
   }
 }
 /** @param {string} line */
-function appendTriggerLog(line) {
+function appendTriggerLog(line, root) {
   try {
-    const p = triggerLogPath();
+    const p = triggerLogPath(root);
     if (!p) return;
     fs.mkdirSync(path.dirname(p), { recursive: true });
     fs.appendFileSync(p, line + (os.EOL || '\n'));
@@ -105,69 +102,77 @@ const completedResult = (extra = {}) => ({
 export function makeWindowsUninstallHandler({
   spawnImpl = nodeSpawn,
   execImpl = execFileSync,
-  scriptPath = null
+  scriptPath = null,
+  root = runtimeRoot()
 } = {}) {
   return async () => {
-    // Fail loud, not silent: firing `schtasks /run` at a missing task
-    // reports success while nothing happens (hosts installed before the
-    // 0.4.94 installer have no "NC Uninstall" task). Check first so the
-    // panel shows the real precondition instead of a phantom success.
+    // Verify the existing independent executor belongs to this tree. A task
+    // name alone could route removal into another installation.
+    let ownershipVerified = false;
     let taskPresent = false;
+    let serviceOwned = true;
     try {
-      execImpl('schtasks.exe', ['/query', '/tn', 'NC Uninstall'], {
-        stdio: 'ignore',
+      const query = String.raw`
+$ErrorActionPreference = 'Stop'
+$Root = '${String(root).replace(/'/g, "''")}'
+$Task = Get-ScheduledTask -TaskName 'NC Uninstall' -TaskPath '\' -ErrorAction SilentlyContinue
+$Actions = @($Task.Actions)
+$TaskOwned = $Task -and $Actions.Count -eq 1 -and
+  $Actions[0].WorkingDirectory -ieq $Root -and
+  ($Actions[0].Execute -ieq 'powershell.exe' -or $Actions[0].Execute -ieq (Join-Path $PSHOME 'powershell.exe')) -and
+  $Actions[0].Arguments -ceq ('-NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $Root 'uninstall.ps1') + '"') -and
+  $Task.Principal.UserId -in @('SYSTEM', 'NT AUTHORITY\SYSTEM', 'S-1-5-18') -and
+  $Task.Principal.LogonType -eq 'ServiceAccount'
+$Svc = Get-CimInstance Win32_Service -Filter "Name='NCClient'" -ErrorAction Stop
+$ServiceOwned = $Svc -and $Svc.PathName.StartsWith(('"' + (Join-Path $Root 'service\nc-service.exe') + '" '), [StringComparison]::OrdinalIgnoreCase)
+@{ taskOwned = [bool]$TaskOwned; serviceOwned = [bool]$ServiceOwned } | ConvertTo-Json -Compress
+`;
+      const state = JSON.parse(String(execImpl('powershell.exe', ['-NoProfile', '-Command', query], {
+        stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
-        timeout: 15000
-      });
-      taskPresent = true;
+        timeout: 15000,
+        encoding: 'utf8'
+      })).replace(/^\uFEFF/, ''));
+      ownershipVerified = typeof state.taskOwned === 'boolean' && typeof state.serviceOwned === 'boolean';
+      taskPresent = ownershipVerified && state.taskOwned;
+      serviceOwned = !ownershipVerified || state.serviceOwned;
     } catch {}
-    if (!taskPresent) {
-      // Task-independent fallback: the on-demand SYSTEM task is missing
-      // (pre-0.4.94 install, or machine policy/AV blocks task registration).
-      // When the installer granted Local Service stop+delete on the service
-      // object, the agent removes its own service directly, then best-effort
-      // cleans processes and tree. Task/startup leftovers may remain for an
-      // admin to sweep; the host is dead either way.
-      // Fire-and-forget must stay observable: a synchronous sc.exe query
-      // proves (in the job result) that exec works and the service exists,
-      // and every async step appends to a transcript under the data dir
-      // (readable via file_read), so a silent trigger can be diagnosed
-      // post-mortem instead of guessed at.
-      let probe = 'sc-query-failed';
-      try {
-        const out = execImpl('sc.exe', ['query', 'NCClient'], {
-          stdio: ['ignore', 'pipe', 'pipe'],
-          windowsHide: true,
-          timeout: 15000,
-          encoding: 'utf8'
-        });
-        const text = String(out || '');
-        probe = /STATE\s*:\s*4/i.test(text) ? 'service-running' : 'service-not-running';
-      } catch {}
+    let userMode = false;
+    try {
+      userMode = /^NC_SERVICE_MODE=user\r?$/m.test(fs.readFileSync(path.join(root, 'config', 'nc-client.env'), 'utf8').replace(/^\uFEFF/, ''));
+    } catch {}
+    if (!ownershipVerified || (!userMode && !taskPresent) || (userMode && (serviceOwned || !isSafeUserUninstallRoot(root)))) {
+      // Detached children remain in the service's non-breakaway Job. Stopping
+      // NCClient would kill the trigger before delete/cleanup, not initiate
+      // removal. Never manufacture an executor or silently elevate here.
+      return {
+        status: 'failed', exit_code: null, stdout: '', stderr: '',
+        error: 'UNINSTALL_MECHANISM_UNAVAILABLE', duration_ms: 0,
+        result_payload: { uninstall_initiated: false, mechanism: 'direct-service' }
+      };
+    }
+    if (userMode) {
+      // Preserve the existing delayed, own-tree user cleanup without SCM
+      // verbs. A service owned by another root must never be stopped/deleted.
       let spawned = false;
-      appendTriggerLog('handler-spawn-attempt ' + new Date().toISOString());
+      appendTriggerLog('handler-spawn-attempt ' + new Date().toISOString(), root);
       // Node-based trigger (watchdog pattern): powershell spawned from the
       // agent proved stillborn on hardened hosts, while node children start
       // reliably (OTA watchdog). The script retires the supervisor via
-      // retired.json, removes the service, kills the agent by PID (precise,
+      // retired.json, kills the agent by PID (precise,
       // no cmdline filtering), and best-effort removes the tree.
       const nodeTrigger = [
         "import fs from 'node:fs';",
         "import path from 'node:path';",
-        "import { execFileSync } from 'node:child_process';",
-        `const LOG = ${JSON.stringify(triggerLogPath())};`,
+        `const LOG = ${JSON.stringify(triggerLogPath(root))};`,
         `const AGENT_PID = ${Number(process.pid) || 0};`,
-        `const ROOT = ${JSON.stringify(triggerLogPath() ? path.dirname(path.dirname(triggerLogPath())) : '')};`,
+        `const ROOT = ${JSON.stringify(root)};`,
         "const w = (s) => { try { fs.appendFileSync(LOG, s + '\\n'); } catch {} };",
         'const sleep = (ms) => new Promise((r) => setTimeout(r, ms));',
-        "const run = (f, a) => { try { const o = execFileSync(f, a, { encoding: 'utf8', timeout: 20000, windowsHide: true }); w(f + ' ' + a.join(' ') + ' :: ' + String(o).trim().slice(0, 160)); } catch (e) { w(f + ' ' + a.join(' ') + ' FAIL ' + (e.status !== undefined ? e.status : e.message)); } };",
         '(async () => {',
         "  w('node-trigger-start ' + new Date().toISOString());",
         '  await sleep(8000);',
         "  try { fs.writeFileSync(path.join(ROOT, 'data', 'retired.json'), JSON.stringify({ retired: true, reason: 'panel-uninstall', at: new Date().toISOString() })); w('retired-written'); } catch (e) { w('retired FAIL ' + e.message); }",
-        "  run('sc.exe', ['stop', 'NCClient']);",
-        '  await sleep(3000);',
-        "  run('sc.exe', ['delete', 'NCClient']);",
         "  try { process.kill(AGENT_PID, 'SIGTERM'); w('agent-sigterm ' + AGENT_PID); } catch (e) { w('agent-kill FAIL ' + e.message); }",
         '  await sleep(3000);',
         "  let sweep = { removed: 0, leftovers: ['unimported'] };",
@@ -186,7 +191,7 @@ export function makeWindowsUninstallHandler({
         "})().catch((e) => { try { fs.appendFileSync(LOG, 'FATAL ' + (e && e.message) + '\\n'); } catch {} });"
       ].join('\n');
       try {
-        const logPath = triggerLogPath();
+        const logPath = triggerLogPath(root);
         if (!logPath) throw new Error('no trigger log path');
         const dest = scriptPath || path.join(path.dirname(logPath), 'uninstall-trigger.mjs');
         fs.mkdirSync(path.dirname(dest), { recursive: true });
@@ -198,9 +203,13 @@ export function makeWindowsUninstallHandler({
           // Sibling pattern (updater.mjs): no console window on win32.
           windowsHide: true
         });
+        await new Promise((resolve, reject) => {
+          child.once('spawn', resolve);
+          child.once('error', reject);
+        });
         if (child && typeof child.unref === 'function') child.unref();
         spawned = true;
-        appendTriggerLog('handler-spawn-ok');
+        appendTriggerLog('handler-spawn-ok', root);
       } catch {}
       if (!spawned) {
         return {
@@ -210,10 +219,10 @@ export function makeWindowsUninstallHandler({
           stderr: '',
           error: 'UNINSTALL_TRIGGER_FAILED',
           duration_ms: 0,
-          result_payload: { uninstall_initiated: false, mechanism: 'direct-service', probe }
+          result_payload: { uninstall_initiated: false, mechanism: 'direct-service' }
         };
       }
-      return completedResult({ mechanism: 'direct-service', probe });
+      return completedResult({ mechanism: 'direct-service' });
     }
     // Preferred path: the on-demand SYSTEM task does full cleanup (service,
     // tasks, startup entry, tree) as SYSTEM. schtasks /run returns at once

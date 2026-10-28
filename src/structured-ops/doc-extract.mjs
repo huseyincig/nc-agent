@@ -24,7 +24,9 @@
  * (no backtracking regexes over untrusted input).
  */
 import fs from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
 import zlib from 'node:zlib';
+import { authorizeMutationPath } from '../filesystem/path-auth.mjs';
 
 export const MAX_DOC_BYTES = 8 * 1024 * 1024;
 export const MAX_TEXT_CHARS = 65536;
@@ -39,18 +41,20 @@ export const DOC_FORMATS = Object.freeze(['docx', 'xlsx', 'pdf']);
  * Bounded whole-file read with the same pre-open regular-file guard as
  * readBounded (a planted FIFO inside the workspace must not hang the job).
  * @param {string} file realpath-resolved absolute path
+ * @param {typeof fs} [fsApi]
  * @returns {Promise<{bytes: number, buffer: Buffer}>}
  */
-export async function readDocFile(file) {
-  const pre = await fs.stat(file);
-  if (!pre.isFile()) throw new Error('PATH_TYPE_NOT_SUPPORTED');
-  if (pre.size > MAX_DOC_BYTES) throw new Error('DOC_TOO_LARGE');
-  if (pre.size < 1) throw new Error('DOC_PARSE_FAILED');
-  const fh = await fs.open(file, 'r');
+export async function readDocFile(file, fsApi = fs) {
+  // Recheck the resolved spelling immediately before open, then read only the
+  // verified handle. No-follow alone cannot protect mutable parent directories.
+  await authorizeMutationPath(file, { allowAll: true, fsApi });
+  const fh = await fsApi.open(file,
+    fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK || 0) | (fsConstants.O_NOFOLLOW || 0));
   try {
     const st = await fh.stat();
     if (!st.isFile()) throw new Error('PATH_TYPE_NOT_SUPPORTED');
     if (st.size > MAX_DOC_BYTES) throw new Error('DOC_TOO_LARGE');
+    if (st.size < 1) throw new Error('DOC_PARSE_FAILED');
     const buf = Buffer.alloc(Math.max(0, Math.trunc(st.size)));
     let read = 0;
     while (read < buf.length) {
@@ -141,12 +145,15 @@ export function inflateZipEntry(buf, entries, name, budget = { value: 0 }) {
   const dataStart = e.offset + 30 + localNameLen + localExtraLen;
   if (dataStart + e.compSize > buf.length) throw new Error('DOC_PARSE_FAILED');
   const raw = buf.subarray(dataStart, dataStart + e.compSize);
+  const remaining = MAX_INFLATED_BYTES - budget.value;
   let out;
   if (e.method === 0) {
+    if (raw.length > remaining) throw new Error('DOC_PARSE_FAILED');
     out = Buffer.from(raw);
   } else if (e.method === 8) {
+    if (remaining <= 0) throw new Error('DOC_PARSE_FAILED');
     try {
-      out = zlib.inflateRawSync(raw, { maxOutputLength: MAX_INFLATED_BYTES });
+      out = zlib.inflateRawSync(raw, { maxOutputLength: remaining });
     } catch {
       throw new Error('DOC_PARSE_FAILED');
     }
@@ -158,6 +165,7 @@ export function inflateZipEntry(buf, entries, name, budget = { value: 0 }) {
     // entries are compared loosely (some writers disagree by trailing bytes).
     throw new Error('DOC_PARSE_FAILED');
   }
+  if (out.length > remaining) throw new Error('DOC_PARSE_FAILED');
   budget.value += out.length;
   return out;
 }
@@ -187,23 +195,23 @@ function unescapeXml(xml) {
  */
 function wordTextRuns(xml) {
   const parts = [];
-  let i = 0;
-  while (i < xml.length) {
-    const tab = xml.indexOf('<w:tab', i);
-    const br = xml.indexOf('<w:br', i);
-    const t = xml.indexOf('<w:t', i);
-    const next = [tab, br, t].filter((x) => x >= 0).sort((a, b) => a - b)[0];
-    if (next === undefined) break;
-    if (next === t) {
-      const start = xml.indexOf('>', t);
+  const tags = /<w:(t|tab|br)(?=[\s/>])/g;
+  let tag;
+  while ((tag = tags.exec(xml)) !== null) {
+    const start = xml.indexOf('>', tags.lastIndex);
+    if (start < 0) break;
+    if (tag[1] === 't') {
+      if (xml[start - 1] === '/') {
+        tags.lastIndex = start + 1;
+        continue;
+      }
       const end = xml.indexOf('</w:t>', start);
-      if (start < 0 || end < 0) break;
+      if (end < 0) break;
       parts.push(unescapeXml(xml.slice(start + 1, end)));
-      i = end + 6;
+      tags.lastIndex = end + 6;
     } else {
-      parts.push(next === tab ? '\t' : '\n');
-      const end = xml.indexOf('>', next);
-      i = end < 0 ? xml.length : end + 1;
+      parts.push(tag[1] === 'tab' ? '\t' : '\n');
+      tags.lastIndex = start + 1;
     }
   }
   return parts.join('');
@@ -535,13 +543,24 @@ export function extractXlsx(buf, { maxChars = MAX_TEXT_CHARS } = {}) {
  * Decode one PDF content stream body (already sliced between stream/endstream).
  * @param {Buffer} data
  * @param {string} filter raw /Filter value from the owning dict ('' when absent)
+ * @param {{value: number}} [budget]
  */
-function decodePdfStream(data, filter) {
+export function decodePdfStream(data, filter, budget = { value: 0 }) {
   const f = String(filter || '').trim();
-  if (!f || f === '/None') return { bytes: Buffer.from(data), skipped: false };
+  const remaining = MAX_INFLATED_BYTES - budget.value;
+  if (!f || f === '/None') {
+    if (data.length > remaining) throw new Error('DOC_PARSE_FAILED');
+    budget.value += data.length;
+    return { bytes: Buffer.from(data), skipped: false };
+  }
   if (/FlateDecode/.test(f)) {
+    if (remaining <= 0) throw new Error('DOC_PARSE_FAILED');
     try {
-      return { bytes: zlib.inflateSync(data), skipped: false };
+      // T-C5: bound inflation (zip-bomb/OOM): inflateSync without
+      // maxOutputLength lets a tiny stream expand without limit.
+      const bytes = zlib.inflateSync(data, { maxOutputLength: remaining });
+      budget.value += bytes.length;
+      return { bytes, skipped: false };
     } catch {
       throw new Error('DOC_PARSE_FAILED');
     }
@@ -722,6 +741,7 @@ export function extractPdf(buf, { maxChars = MAX_TEXT_CHARS } = {}) {
   }
   const texts = [];
   let scanned = 0;
+  const budget = { value: 0 };
   let skipped = 0;
   let i = 0;
   while (i < latin.length && scanned < MAX_PDF_STREAMS) {
@@ -745,7 +765,7 @@ export function extractPdf(buf, { maxChars = MAX_TEXT_CHARS } = {}) {
     const data = buf.subarray(dataStart, Math.max(dataStart, e - (latin[e - 1] === '\n' ? 1 : 0)));
     scanned++;
     try {
-      const { bytes, skipped: wasSkipped } = decodePdfStream(data, filter);
+      const { bytes, skipped: wasSkipped } = decodePdfStream(data, filter, budget);
       if (wasSkipped) {
         skipped++;
         i = e + 9;

@@ -1,6 +1,9 @@
 import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
 import { runPrivilegedCapture } from './privileged-helper-spawn.mjs';
 import { macLogArgs } from '../src/logs/system-log-ops.mjs';
+import { isSensitivePath } from '../src/filesystem/sensitive-paths.mjs';
 
 const SERVICE_CONTROL_OPS = Object.freeze(['start', 'stop', 'restart']);
 const SERVICE_CONTROL_UNIT_RE = /^[A-Za-z0-9_.\-]{1,256}$/;
@@ -34,7 +37,7 @@ export async function executeDarwinServiceControl(payload) {
   if (typeof rec.unit !== 'string' || !SERVICE_CONTROL_UNIT_RE.test(rec.unit))
     throw new Error('PRIVILEGED_SERVICE_UNIT_INVALID');
   const { op, unit } = { op: String(rec.op), unit: String(rec.unit) };
-  const label = unit.includes('.') ? unit : 'com.nc.client';
+  const label = unit;
   let r;
   if (op === 'start') r = await runCapture('launchctl', ['kickstart', `system/${label}`]);
   else if (op === 'stop') r = await runCapture('launchctl', ['bootout', `system/${label}`]);
@@ -114,7 +117,17 @@ function revalidateOperatedPath(target, execTarget) {
  * trees fail closed rather than stalling the daemon event loop.
  * @param {string} target
  */
-function assertNoSymlinksRecursive(target) {
+export function assertNoSymlinksRecursive(target) {
+  // A file (non-directory) target has no tree to traverse: return early so
+  // a recursive op on a single file keeps working. Unresolvable targets
+  // fail closed (the exec cannot be verified).
+  let root;
+  try {
+    root = fs.lstatSync(target);
+  } catch (e) {
+    throw new Error('PRIVILEGED_PATH_DENIED', { cause: e });
+  }
+  if (!root.isDirectory()) return;
   const stack = [target];
   let dirs = 0;
   while (stack.length) {
@@ -122,8 +135,12 @@ function assertNoSymlinksRecursive(target) {
     let entries;
     try {
       entries = fs.readdirSync(cur, { withFileTypes: true });
-    } catch {
-      continue; // unreadable entries fail closed at exec time
+    } catch (e) {
+      // L06-10: fail closed. Skipping an unreadable directory waved an
+      // unverifiable subtree through to a root chmod -R/chown -R — an
+      // attacker-controlled EACCES/ENOENT plant (or a swap mid-walk)
+      // became an unaudited hole instead of a denial.
+      throw new Error('PRIVILEGED_PATH_DENIED', { cause: e });
     }
     for (const entry of entries) {
       if (entry.isSymbolicLink()) throw new Error('PRIVILEGED_PATH_DENIED');
@@ -231,6 +248,374 @@ export async function executeDarwinFilePermissions(payload) {
     current_owner: afterR.code === 0 ? afterR.out.trim() : null
   };
 }
+
+/**
+ * @param {string} target
+ * @param {object} [options]
+ * @param {boolean} [options.allowAll]
+ * @param {Array<string>} [options.roots]
+ * @param {boolean} [options.checkAncestor]
+ */
+function validateDarwinHelperPath(
+  target,
+  { allowAll = false, roots = [], checkAncestor = false } = {}
+) {
+  if (!target || typeof target !== 'string' || target.length > 4096)
+    throw new Error('PRIVILEGED_PAYLOAD_INVALID');
+  if (target.includes('\0') || /[\x00-\x1f]/.test(target))
+    throw new Error('PRIVILEGED_PAYLOAD_INVALID');
+  if (!target.startsWith('/'))
+    throw new Error('PRIVILEGED_PAYLOAD_INVALID');
+  if (target.includes('/../') || target.endsWith('/..') || target === '/..')
+    throw new Error('PRIVILEGED_PATH_DENIED');
+  if (DARWIN_FILE_PERMS_DENYLIST_RE.test(normalizePosixDenyTarget(target)))
+    throw new Error('PRIVILEGED_PATH_DENIED');
+  if (isSensitivePath(target, 'darwin'))
+    throw new Error('PRIVILEGED_PATH_DENIED');
+
+  let resolvedTarget = null;
+  let targetExists = false;
+  try {
+    resolvedTarget = fs.realpathSync(target);
+    targetExists = true;
+  } catch {
+    targetExists = false;
+  }
+
+  if (targetExists && resolvedTarget) {
+    if (DARWIN_FILE_PERMS_DENYLIST_RE.test(normalizePosixDenyTarget(resolvedTarget)))
+      throw new Error('PRIVILEGED_PATH_DENIED');
+    if (isSensitivePath(resolvedTarget, 'darwin'))
+      throw new Error('PRIVILEGED_PATH_DENIED');
+  } else if (checkAncestor) {
+    let cur = path.dirname(target);
+    let ancestorResolved = null;
+    while (true) {
+      try {
+        ancestorResolved = fs.realpathSync(cur);
+        break;
+      } catch {
+        const p = path.dirname(cur);
+        if (p === cur) throw new Error('PRIVILEGED_PATH_DENIED');
+        cur = p;
+      }
+    }
+    if (DARWIN_FILE_PERMS_DENYLIST_RE.test(normalizePosixDenyTarget(ancestorResolved)))
+      throw new Error('PRIVILEGED_PATH_DENIED');
+    if (isSensitivePath(ancestorResolved, 'darwin'))
+      throw new Error('PRIVILEGED_PATH_DENIED');
+    resolvedTarget = ancestorResolved;
+  } else {
+    throw new Error('PRIVILEGED_FILE_NOT_FOUND');
+  }
+
+  if (allowAll !== true) {
+    if (!Array.isArray(roots) || roots.length === 0)
+      throw new Error('PRIVILEGED_PATH_DENIED');
+    const realRoots = [];
+    for (const r of roots) {
+      try {
+        realRoots.push(fs.realpathSync(r));
+      } catch {}
+    }
+    if (realRoots.length === 0)
+      throw new Error('PRIVILEGED_PATH_DENIED');
+    const inside = realRoots.some(
+      (rr) => resolvedTarget === rr || resolvedTarget.startsWith(rr.endsWith('/') ? rr : rr + '/')
+    );
+    if (!inside)
+      throw new Error('PRIVILEGED_PATH_DENIED');
+  }
+
+  return { target, resolvedTarget, exists: targetExists };
+}
+
+/**
+ * Bounded file read via privileged helper on macOS.
+ * @param {unknown} payload
+ */
+export async function executeDarwinFileRead(payload) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload))
+    throw new Error('PRIVILEGED_PAYLOAD_INVALID');
+  const rec = /** @type {Record<string, unknown>} */ (payload);
+  const target = String(rec.path || rec.target || '');
+  if (!target) throw new Error('PRIVILEGED_PAYLOAD_INVALID');
+  const allowAll = rec.allow_all === true || rec.allow_all_filesystem === true;
+  const roots = Array.isArray(rec.roots)
+    ? /** @type {Array<string>} */ (rec.roots)
+    : Array.isArray(rec.allowed_roots)
+      ? /** @type {Array<string>} */ (rec.allowed_roots)
+      : [];
+
+  validateDarwinHelperPath(target, { allowAll, roots, checkAncestor: false });
+
+  let st;
+  try {
+    st = fs.lstatSync(target);
+  } catch (e) {
+    if (e && typeof e === 'object' && /** @type {{code?: unknown}} */ (e).code === 'ENOENT') {
+      throw new Error('PRIVILEGED_FILE_NOT_FOUND', { cause: e });
+    }
+    throw new Error('PRIVILEGED_PATH_DENIED', { cause: e });
+  }
+  if (st.isSymbolicLink() || !st.isFile()) {
+    throw new Error('PRIVILEGED_PATH_DENIED');
+  }
+
+  const maxBytes = Math.max(1, Math.min(1024 * 1024, Number(rec.max_bytes || 65536)));
+  let fd;
+  try {
+    fd = fs.openSync(target, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  } catch (openErr) {
+    const code =
+      openErr && typeof openErr === 'object'
+        ? /** @type {{code?: unknown}} */ (openErr).code
+        : null;
+    if (code === 'ELOOP' || code === 'EMLINK') throw new Error('PRIVILEGED_PATH_DENIED', { cause: openErr });
+    if (code === 'ENOENT') throw new Error('PRIVILEGED_FILE_NOT_FOUND', { cause: openErr });
+    throw new Error('PRIVILEGED_PATH_DENIED', { cause: openErr });
+  }
+  try {
+    const buf = Buffer.alloc(Math.min(st.size, maxBytes));
+    let readBytes = 0;
+    if (buf.length > 0) {
+      readBytes = fs.readSync(fd, buf, 0, buf.length, 0);
+    }
+    return {
+      path: target,
+      content: buf.subarray(0, readBytes).toString('utf8'),
+      bytes: st.size,
+      truncated: st.size > maxBytes,
+      success: true
+    };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * Bounded file mutation via privileged helper on macOS (write, edit, move, copy, delete, mkdir).
+ * @param {unknown} payload
+ */
+export async function executeDarwinFileWrite(payload) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload))
+    throw new Error('PRIVILEGED_PAYLOAD_INVALID');
+  const rec = /** @type {Record<string, unknown>} */ (payload);
+  const action = String(rec.action || 'write').toLowerCase();
+  const allowAll = rec.allow_all === true || rec.allow_all_filesystem === true;
+  const roots = Array.isArray(rec.roots)
+    ? /** @type {Array<string>} */ (rec.roots)
+    : Array.isArray(rec.allowed_roots)
+      ? /** @type {Array<string>} */ (rec.allowed_roots)
+      : [];
+
+  if (!['write', 'edit', 'move', 'copy', 'delete', 'mkdir'].includes(action))
+    throw new Error('PRIVILEGED_HELPER_OPERATION_NOT_ALLOWED');
+
+  if (action === 'delete') {
+    const target = String(rec.path || rec.target || '');
+    if (!target) throw new Error('PRIVILEGED_PAYLOAD_INVALID');
+    if (target === '/' || target === '/..' || target.endsWith('/..'))
+      throw new Error('PRIVILEGED_PATH_DENIED');
+    validateDarwinHelperPath(target, { allowAll, roots, checkAncestor: false });
+    let st;
+    try {
+      st = fs.lstatSync(target);
+    } catch (e) {
+      if (e && typeof e === 'object' && /** @type {{code?: unknown}} */ (e).code === 'ENOENT') {
+        return { action, path: target, deleted: false, success: true };
+      }
+      throw new Error('PRIVILEGED_PATH_DENIED', { cause: e });
+    }
+    if (st.isDirectory()) {
+      if (rec.recursive === true) {
+        fs.rmSync(target, { recursive: true, force: true });
+      } else {
+        fs.rmdirSync(target);
+      }
+    } else {
+      fs.unlinkSync(target);
+    }
+    return { action, path: target, deleted: true, success: true };
+  }
+
+  if (action === 'mkdir') {
+    const target = String(rec.path || rec.target || '');
+    if (!target) throw new Error('PRIVILEGED_PAYLOAD_INVALID');
+    validateDarwinHelperPath(target, { allowAll, roots, checkAncestor: true });
+    let exists = false;
+    try {
+      exists = fs.existsSync(target);
+    } catch {}
+    if (exists) {
+      return { action, path: target, created: false, success: true };
+    }
+    fs.mkdirSync(target, { recursive: rec.recursive !== false });
+    return { action, path: target, created: true, success: true };
+  }
+
+  if (action === 'move') {
+    const source = String(rec.source || rec.path || '');
+    const destination = String(rec.destination || rec.target || '');
+    if (!source || !destination) throw new Error('PRIVILEGED_PAYLOAD_INVALID');
+    validateDarwinHelperPath(source, { allowAll, roots, checkAncestor: false });
+    validateDarwinHelperPath(destination, { allowAll, roots, checkAncestor: true });
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    fs.renameSync(source, destination);
+    return { action, source, destination, success: true };
+  }
+
+  if (action === 'copy') {
+    const source = String(rec.source || rec.path || '');
+    const destination = String(rec.destination || rec.target || '');
+    if (!source || !destination) throw new Error('PRIVILEGED_PAYLOAD_INVALID');
+    validateDarwinHelperPath(source, { allowAll, roots, checkAncestor: false });
+    validateDarwinHelperPath(destination, { allowAll, roots, checkAncestor: true });
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    fs.cpSync(source, destination, { recursive: true, force: rec.overwrite === true });
+    return { action, source, destination, success: true };
+  }
+
+  if (action === 'edit') {
+    const target = String(rec.path || rec.target || '');
+    if (!target) throw new Error('PRIVILEGED_PAYLOAD_INVALID');
+    validateDarwinHelperPath(target, { allowAll, roots, checkAncestor: false });
+    let st;
+    try {
+      st = fs.lstatSync(target);
+    } catch {
+      throw new Error('PRIVILEGED_FILE_NOT_FOUND');
+    }
+    if (st.isSymbolicLink() || !st.isFile()) throw new Error('PRIVILEGED_PATH_DENIED');
+    const before = fs.readFileSync(target, 'utf8');
+    const prevSha = crypto.createHash('sha256').update(before).digest('hex');
+    if (rec.expected_sha256 && prevSha !== rec.expected_sha256)
+      throw new Error('PRIVILEGED_SHA_MISMATCH');
+    // L01a-7: CAS parity with the agent-side file_edit (darwin previously
+    // applied String.replace blindly: absent old_text silently no-opped
+    // while reporting success, and multiple matches replaced only the
+    // first). Reject absent/ambiguous blocks; success requires a sha change.
+    let after = before;
+    if (Array.isArray(rec.edits)) {
+      for (const edit of /** @type {Array<Record<string, unknown>>} */ (rec.edits)) {
+        const oldText = String(edit.old_text ?? '');
+        const newText = String(edit.new_text ?? '');
+        if (!oldText) throw new Error('EXPECTED_TEXT_NOT_FOUND');
+        const occurrences = after.split(oldText).length - 1;
+        if (occurrences === 0) throw new Error('EXPECTED_TEXT_NOT_FOUND');
+        if (occurrences !== 1)
+          throw new Error(`EXPECTED_TEXT_AMBIGUOUS:${occurrences}`);
+        after = after.replace(oldText, () => newText);
+      }
+    } else if (rec.expected_text && rec.replacement_text) {
+      const oldText = String(rec.expected_text);
+      const occurrences = after.split(oldText).length - 1;
+      if (occurrences === 0) throw new Error('EXPECTED_TEXT_NOT_FOUND');
+      if (occurrences !== 1) throw new Error(`EXPECTED_TEXT_AMBIGUOUS:${occurrences}`);
+      after = after.replace(oldText, () => String(rec.replacement_text));
+    } else if (typeof rec.content === 'string') {
+      after = rec.content;
+    }
+    const fd = fs.openSync(
+      target,
+      fs.constants.O_WRONLY | fs.constants.O_TRUNC | (fs.constants.O_NOFOLLOW || 0)
+    );
+    try {
+      fs.writeSync(fd, Buffer.from(after, 'utf8'));
+    } finally {
+      fs.closeSync(fd);
+    }
+    const afterSha = crypto.createHash('sha256').update(after).digest('hex');
+    // L01a-7: success only when the sha actually changed (a no-op edit
+    // previously reported success).
+    const changed = afterSha !== prevSha;
+    return {
+      action,
+      path: target,
+      bytes_written: Buffer.byteLength(after, 'utf8'),
+      previous_sha256: prevSha,
+      sha256: afterSha,
+      success: changed
+    };
+  }
+
+  // action === 'write'
+  const target = String(rec.path || rec.target || '');
+  if (!target) throw new Error('PRIVILEGED_PAYLOAD_INVALID');
+  if (typeof rec.content !== 'string' || rec.content.length > 10 * 1024 * 1024)
+    throw new Error('PRIVILEGED_PAYLOAD_INVALID');
+  validateDarwinHelperPath(target, { allowAll, roots, checkAncestor: true });
+
+  const parent = path.dirname(target);
+  fs.mkdirSync(parent, { recursive: true });
+
+  const mode = String(rec.mode || 'replace');
+  let prevSha = null;
+  let exists = false;
+  try {
+    const st = fs.lstatSync(target);
+    if (st.isSymbolicLink() || !st.isFile()) throw new Error('PRIVILEGED_PATH_DENIED');
+    exists = true;
+    if (mode === 'create' && st.size > 0) throw new Error('PRIVILEGED_FILE_EXISTS');
+    const existingContent = fs.readFileSync(target);
+    prevSha = crypto.createHash('sha256').update(existingContent).digest('hex');
+    if (rec.expected_sha256 && prevSha !== rec.expected_sha256)
+      throw new Error('PRIVILEGED_SHA_MISMATCH');
+  } catch (e) {
+    if (e && typeof e === 'object' && /** @type {{code?: unknown}} */ (e).code !== 'ENOENT') {
+      if (e instanceof Error && e.message.startsWith('PRIVILEGED_')) throw e;
+      throw new Error('PRIVILEGED_PATH_DENIED', { cause: e });
+    }
+  }
+
+  let fd;
+  try {
+    if (mode === 'append') {
+      fd = fs.openSync(
+        target,
+        fs.constants.O_WRONLY | fs.constants.O_APPEND | (fs.constants.O_NOFOLLOW || 0)
+      );
+    } else {
+      fd = fs.openSync(
+        target,
+        fs.constants.O_WRONLY |
+          fs.constants.O_CREAT |
+          fs.constants.O_TRUNC |
+          (fs.constants.O_NOFOLLOW || 0),
+        0o644
+      );
+    }
+    fs.writeSync(fd, Buffer.from(rec.content, 'utf8'));
+  } catch (openErr) {
+    const code =
+      openErr && typeof openErr === 'object'
+        ? /** @type {{code?: unknown}} */ (openErr).code
+        : null;
+    if (code === 'ELOOP' || code === 'EMLINK') throw new Error('PRIVILEGED_PATH_DENIED', { cause: openErr });
+    if (code === 'EACCES' || code === 'EPERM') throw new Error('PRIVILEGED_ACCESS_DENIED', { cause: openErr });
+    if (code === 'EEXIST') throw new Error('PRIVILEGED_FILE_EXISTS', { cause: openErr });
+    throw openErr;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+
+  let finalSha;
+  if (mode === 'append' && exists) {
+    finalSha = crypto.createHash('sha256').update(fs.readFileSync(target)).digest('hex');
+  } else {
+    finalSha = crypto.createHash('sha256').update(rec.content).digest('hex');
+  }
+
+  return {
+    action: 'write',
+    path: target,
+    bytes_written: Buffer.byteLength(rec.content, 'utf8'),
+    previous_sha256: prevSha,
+    sha256: finalSha,
+    success: true
+  };
+}
+
 /**
  * @param {object} [options]
  * @param {string} [options.uninstallScript]
@@ -245,9 +630,27 @@ export function darwinPrivilegedHelperHandlers({
     package_control: executeDarwinPackageControl,
     system_log_read: executeDarwinSystemLogRead,
     file_permissions: executeDarwinFilePermissions,
+    file_read: executeDarwinFileRead,
+    file_write: executeDarwinFileWrite,
     client_uninstall: async (/** @type {unknown} */ payload) => {
       if (!payload || typeof payload !== 'object' || Array.isArray(payload))
         throw new Error('PRIVILEGED_PAYLOAD_INVALID');
+      // L01a-10: a root daemon must never exec a script it does not own
+      // exclusively — a group/world-writable or non-root-owned uninstall
+      // script is a privilege-escalation plant. Fail closed before exec.
+      let scriptStat = null;
+      try {
+        scriptStat = fs.statSync(String(uninstallScript));
+      } catch {
+        scriptStat = null;
+      }
+      if (
+        !scriptStat ||
+        !scriptStat.isFile() ||
+        scriptStat.uid !== 0 ||
+        (scriptStat.mode & 0o022) !== 0
+      )
+        throw new Error('PRIVILEGED_PATH_DENIED');
       const r = await runCapture('/bin/sh', [String(uninstallScript)]);
       return { success: r.code === 0, message: (r.out || `exit ${r.code}`).slice(0, 2000) };
     }

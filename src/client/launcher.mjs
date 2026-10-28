@@ -150,6 +150,13 @@ const invoked =
 // Applications (Node SEA rejects ESM entry). Floating the promise is
 // equivalent — client loops keep the loop alive; rejection exits nonzero.
 if (invoked) {
+  process.on('unhandledRejection', (reason) => {
+    try {
+      console.error(
+        `[nc-launcher] unhandled rejection: ${reason instanceof Error ? (reason.stack || reason.message) : String(reason)}`
+      );
+    } catch {}
+  });
   // V-32.6: log startup failures instead of exiting silently with code 1.
   runLauncher().catch((e) => {
     try {

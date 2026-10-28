@@ -272,25 +272,97 @@ export function normalizeServiceMode(value, warnName = null) {
 }
 
 /**
+ * Tolerance for the synchronous start-time identity check below. Parity
+ * with SWEEP_VERIFY_TOLERANCE_MS in process-sessions.mjs (kept local:
+ * this module cannot import process-sessions — it is imported BY it).
+ */
+export const SYNC_VERIFY_TOLERANCE_MS = 120 * 1000;
+/**
+ * Synchronous start-time identity check (R-C1: fail-closed sync kills).
+ * Linux only: reads /proc directly with no fork. Every other platform
+ * returns null (unknown — a synchronous check cannot query WMI/ps
+ * without blocking the loop; callers must fail closed and use the async
+ * terminateSessionTreeAsync path there). Tri-state like the async
+ * verifyProcessStartTime: true = ours, false = someone else's, null =
+ * unknown. Never throws.
+ * @param {unknown} pid
+ * @param {unknown} startedAtIso
+ * @param {{platform?: string}} [options]
+ * @returns {boolean|null}
+ */
+export function verifyProcessStartTimeSync(pid, startedAtIso, { platform = process.platform } = {}) {
+  const expected = Date.parse(String(startedAtIso || ''));
+  if (!Number.isFinite(expected)) return null;
+  const id = Math.floor(Number(pid));
+  if (!Number.isInteger(id) || id < 2) return null;
+  try {
+    if (platform === 'linux') {
+      const stat = fsSync.readFileSync(`/proc/${id}/stat`, 'utf8');
+      const afterComm = stat
+        .slice(stat.lastIndexOf(')') + 1)
+        .trim()
+        .split(/\s+/);
+      const ticks = Number(afterComm[19]);
+      if (!Number.isFinite(ticks)) return null;
+      const btime = Number(
+        fsSync
+          .readFileSync('/proc/stat', 'utf8')
+          .split('\n')
+          .find((l) => l.startsWith('btime'))
+          ?.split(/\s+/)[1]
+      );
+      const ticksPerSec = 100;
+      if (!Number.isFinite(btime)) return null;
+      const actualMs = (btime + ticks / ticksPerSec) * 1000;
+      return Math.abs(actualMs - expected) <= SYNC_VERIFY_TOLERANCE_MS;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+/**
  * @param {import('node:child_process').ChildProcess|null|undefined} child
  * @param {string} [platform]
  * @param {boolean} [force]
+ * @param {{expectedStartedAt?: unknown, expectedPath?: unknown, expectedCommandLine?: unknown}} [options] spawn-time identity (REQUIRED: R-C1 fail-closed — a missing or unverifiable identity sends no signal)
  */
-export function terminateShellTree(child, platform = process.platform, force = false) {
-  if (!child?.pid) return;
+export function terminateShellTree(child, platform = process.platform, force = false, options = {}) {
+  const pid = Math.floor(Number(child?.pid));
+  if (!Number.isInteger(pid) || pid < 2)
+    return { signaled: false, signal: null, graceful: false };
+  // R-C1: the sync path can verify synchronously on linux only; every
+  // other platform (or a missing/unparseable identity) fails closed.
+  // Prefer terminateSessionTreeAsync wherever awaiting is possible.
+  const { expectedStartedAt = null } = options || {};
+  const expectedMs = Date.parse(String(expectedStartedAt || ''));
+  if (!Number.isFinite(expectedMs))
+    return { signaled: false, signal: null, graceful: false, escalation: 'skipped-unverified' };
+  let verdict = null;
+  try {
+    verdict = verifyProcessStartTimeSync(pid, String(expectedStartedAt), { platform });
+  } catch {
+    verdict = null;
+  }
+  if (verdict !== true)
+    return { signaled: false, signal: null, graceful: false, escalation: 'skipped-unverified' };
   if (platform === 'win32') {
-    const line = 'taskkill /PID ' + child.pid + ' /T /F >NUL 2>&1';
-    try {
-      spawn(process.env.ComSpec || process.env.COMSPEC || 'cmd.exe', ['/d', '/s', '/c', line], {
-        stdio: 'ignore',
-        windowsHide: true
-      }).unref();
-    } catch {}
-    return;
+    // Unreachable today (non-linux always fails closed above); kept as
+    // defense in depth so a future sync verifier cannot silently widen.
+    return { signaled: false, signal: null, graceful: false, escalation: 'skipped-unverified' };
   }
   try {
-    process.kill(-child.pid, force ? 'SIGKILL' : 'SIGTERM');
-  } catch {}
+    process.kill(-pid, force ? 'SIGKILL' : 'SIGTERM');
+  } catch {
+    try {
+      /** @type {{kill?: (signal?: string) => unknown}} */ (child)?.kill?.(
+        force ? 'SIGKILL' : 'SIGTERM'
+      );
+    } catch {
+      return { signaled: false, signal: null, graceful: false };
+    }
+  }
+  return { signaled: true, signal: force ? 'SIGKILL' : 'SIGTERM', graceful: !force };
 }
 
 /**
@@ -431,6 +503,9 @@ export function createBoundedOutput(maxBytes) {
  * outside the writable workspace? Catches `> C:\...\NC\...` redirections and
  * absolute tool paths; intentionally NOT a sandbox (env vars, cd-relative
  * writes and pipes escape static analysis — OS permissions remain the floor).
+ * The root hit is prefix-boundary anchored: siblings sharing the namespace
+ * prefix (e.g. `/opt/nc-workspace/...` contains `/opt/nc`) are NOT the agent
+ * tree and must not refuse. The writable-workspace carve-out runs first.
  * @param {string} command
  * @param {string} [platform]
  */
@@ -452,7 +527,15 @@ export function shellTouchesAgentTree(command, platform = process.platform) {
       if (w) text = text.split(w).join('');
     }
     const r = norm(root);
-    return Boolean(r) && text.includes(r);
+    if (!r) return false;
+    // NC-RO-004: regex-escape first — win32 roots carry backslashes
+    // (`c:\programdata\nc`) which are regex escapes when raw (an unescaped
+    // `\n` would match a newline and never the literal path). Boundary after
+    // the root only: `/opt/nc-workspace` escaping the match is desired — the
+    // guard protects the agent tree, not the `/opt/nc` namespace.
+    const escaped = r.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const boundary = '[/\\\\\\s"\'`;|&<>()]';
+    return new RegExp(`${escaped}(?=${boundary}|$)`).test(text);
   } catch {
     return false;
   }
@@ -856,7 +939,7 @@ export function extractJob(claimResponse) {
 
 /**
  * @param {Record<string, unknown>} job
- * @param {{maxStdoutBytes?: number, maxStderrBytes?: number, maxTimeoutSeconds?: number}} [options]
+ * @param {{maxStdoutBytes?: number, maxStderrBytes?: number, maxTimeoutSeconds?: number, spawn?: any}} [options]
  */
 export async function executeShellJob(job, options = {}) {
   const payload = normalizedJobPayload(job);
@@ -907,6 +990,9 @@ export async function executeShellJob(job, options = {}) {
   // A7: optional literal-substring watch for pattern-match telemetry.
   // Invalid/unusable patterns resolve to null (no match timing, no failure).
   const outputPattern = normalizeOutputPattern(payload.output_pattern ?? job.output_pattern);
+  // Load before spawn so identity capture never yields after the child exists.
+  // Dynamic import avoids the cycle with process-sessions' shell helpers.
+  const { captureSpawnIdentity } = await import('../process/process-sessions.mjs');
   const started = Date.now();
   const abortKey = normalizedJobId(job);
   // A7 timing state: elapsed ms from `started`; null until the event fires.
@@ -939,17 +1025,19 @@ export async function executeShellJob(job, options = {}) {
     let killTimer;
     let child;
     // P2-05b: spawn-time identity for the verified timeout/abort kills below
-    // (started_at + shell entrypoint). Dynamic import avoids a static cycle
-    // with process-sessions.mjs (which imports shell helpers from here).
+    // (exact identity + started_at + shell entrypoint).
     let shellStartedAt = new Date(started).toISOString();
     let shellExe = null;
     let shellArgList = null;
+    /** @type {ReturnType<typeof captureSpawnIdentity>} */
+    let shellIdentity = null;
     const killShellTreeVerified = (force) => {
       if (!child) return;
       const target = child;
       const startedAt = shellStartedAt;
       const exe = shellExe;
       const argList = shellArgList;
+      const identity = shellIdentity;
       void (async () => {
         try {
           const { terminateSessionTreeAsync } = await import('../process/process-sessions.mjs');
@@ -959,7 +1047,8 @@ export async function executeShellJob(job, options = {}) {
             graceMs: force ? 0 : 1500,
             expectedStartedAt: startedAt,
             expectedPath: exe,
-            expectedCommandLine: argList
+            expectedCommandLine: argList,
+            expectedIdentity: identity
           });
         } catch {}
       })();
@@ -977,6 +1066,7 @@ export async function executeShellJob(job, options = {}) {
         windowsHide: true,
         windowsVerbatimArguments: Boolean(invocation.windowsVerbatimArguments)
       });
+      shellIdentity = captureSpawnIdentity(child);
       // A8-b: deprioritize the heavy child right after spawn (best-effort,
       // never throws; the agent's own priority is never touched).
       try {
@@ -1077,7 +1167,8 @@ export async function executeShellJob(job, options = {}) {
       const stdoutTruncated = stdoutAcc.truncated;
       const stderrTruncated = stderrAcc.truncated;
       const duration_ms = Date.now() - started;
-      if (spawnError && (!timedOut || spawnError?.message !== 'timed_out')) {
+      const spawnMsg = spawnError && typeof spawnError === 'object' && 'message' in spawnError ? String(spawnError.message) : '';
+      if (spawnError && (!timedOut || spawnMsg !== 'timed_out')) {
         resolve({
           status: 'failed',
           exit_code: null,

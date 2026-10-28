@@ -353,9 +353,10 @@ export async function flushSessionPending(arg1, arg2, arg3) {
 
   for (const item of diskPending) {
     if (state?.jobs?.[item.jobId]?.cancelRequested) continue;
+    const record = state?.jobs?.[item.jobId];
+    if (record && !['claimed', 'running', 'result_pending'].includes(record.status)) continue;
     try {
       sessionResponse(ws, item.jobId, item.result);
-      await item.remove();
       sentJobIds.add(item.jobId);
     } catch {
       // If ws.send fails, DO NOT delete the file (fail-open)
@@ -699,6 +700,7 @@ export async function handleSessionJob(state, ws, msg, {
   auditPolicyFail = async () => {},
   executeTool = async () => ({ status: 'failed', error: 'NO_HANDLER' }),
   log = async () => {},
+  canExecute = () => true,
   stateFile
 } = {}) {
   const jobId = String(msg?.id || ''),
@@ -707,12 +709,12 @@ export async function handleSessionJob(state, ws, msg, {
   // Object.prototype (phantom pending/duplicate hits) and `state.jobs[id] =
   // record` would replace the container prototype. Fail closed like a
   // missing id.
-  if (!jobId || isDangerousJobId(jobId)) return;
+  if (!jobId || isDangerousJobId(jobId) || !canExecute()) return;
   if (state.pendingResults[jobId]) {
     sessionResponse(ws, jobId, state.pendingResults[jobId]);
     return;
   }
-  if (state.jobs[jobId] && state.jobs[jobId].status !== 'result_pending') {
+  if (state.jobs[jobId]) {
     await log('error', 'duplicate_session_job_blocked', {
       job_id: jobId,
       local_status: state.jobs[jobId].status
@@ -727,7 +729,8 @@ export async function handleSessionJob(state, ws, msg, {
     policy_revision: msg.policy_revision ?? null,
     policy_digest: msg.policy_digest ?? null,
     required_capabilities: msg.required_capabilities ?? null,
-    admission_origin: msg.admission_origin ?? null
+    admission_origin: msg.admission_origin ?? null,
+    agent_policy_roots: msg.agent_policy_roots ?? null
   };
   state.jobs[jobId] = {
     status: 'claimed',
@@ -737,6 +740,11 @@ export async function handleSessionJob(state, ws, msg, {
   };
   await writeState(state, stateFile);
   const policyCheck = await ensurePolicy(job);
+  if (state.jobs[jobId]?.cancelRequested || !canExecute()) {
+    state.jobs[jobId].status = 'cancelled';
+    await writeState(state, stateFile);
+    return;
+  }
   let result;
   if (!policyCheck.ok) {
     result = policyFailure(policyCheck);
@@ -746,6 +754,11 @@ export async function handleSessionJob(state, ws, msg, {
     state.jobs[jobId].status = 'running';
     state.jobs[jobId].started_at = new Date().toISOString();
     await writeState(state, stateFile);
+    if (state.jobs[jobId]?.cancelRequested || !canExecute()) {
+      state.jobs[jobId].status = 'cancelled';
+      await writeState(state, stateFile);
+      return;
+    }
     const execStarted = Date.now();
     try {
       result = await executeTool(job);

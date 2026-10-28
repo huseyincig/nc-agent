@@ -187,6 +187,7 @@ export function requiredCapabilitiesForOperation(tool, payload = {}, origin = 'm
     log_query: ['log_read'],
     privilege_status: ['system_snapshot'],
     log_read: ['log_read'],
+    operation_log_read: ['log_read'],
     file_read: ['file_read'],
     file_list: ['file_read'],
     file_browse: ['file_read'],

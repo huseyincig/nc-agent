@@ -5,6 +5,7 @@
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { invokePrivilegedHelper as defaultInvokePrivilegedHelper } from '../../privileged-helper/privileged-helper-ipc.mjs';
+import { terminateSessionTreeAsync } from '../process/process-sessions.mjs';
 
 const run = promisify(execFile);
 const UNIT_RE = /^[\w@.\-:]{1,128}$/;
@@ -27,6 +28,8 @@ export function parseJournalShort(text) {
     if (!line.trim()) continue;
     const m = line.match(/^(\S+)\s+\S+\s+(\S+?)(?:\[(\d+)\])?:\s*(.*)$/);
     if (!m) {
+      // journalctl's empty-result banner is not a journal record.
+      if (line.trimEnd() === '-- No entries --') continue;
       out.push({ timestamp: null, level: null, unit: null, message: line.slice(0, 2000) });
       continue;
     }
@@ -233,17 +236,22 @@ export function winEventScript({
   else if (lv === 'warning') script += `$filter.Level = 3; `;
   else if (lv !== 'all' && lv !== 'info') throw new Error('LOG_LEVEL_INVALID');
 
-  script += `$evts = try { Get-WinEvent -FilterHashtable $filter -MaxEvents ${n + 1} -ErrorAction Stop } catch { @() }; `;
+  script += `$evts = @(try { Get-WinEvent -FilterHashtable $filter -MaxEvents ${n + 1} -ErrorAction Stop } catch { @() }); `;
   // esc() already doubles single quotes; contains is sliced to 200 chars
   // like the journal/mac backends. Literal IndexOf (OrdinalIgnoreCase)
   // instead of -match: `contains` is a literal-substring filter, and a
   // model-controlled -match pattern with nested quantifiers is a ReDoS
   // primitive against agent CPU. Case-insensitivity matches -match
   // defaults; the null guard preserves -match-on-$null evaluating false.
-  if (contains)
-    script += `$evts = $evts | Where-Object { $_.Message -ne $null -and $_.Message.IndexOf('${esc(String(contains).slice(0, 200))}', [System.StringComparison]::OrdinalIgnoreCase) -ge 0 }; `;
-  script += `$evts = $evts | Sort-Object TimeCreated -Descending; `;
-  script += `$evts | Select-Object TimeCreated,Level,ProviderName,@{n='Message';e={$_.Message}} | ConvertTo-Json -Compress -Depth 2`;
+  if (contains) {
+    script += `$scanned = $evts.Count; `;
+    script += `$evts = @($evts | Where-Object { $_.Message -ne $null -and $_.Message.IndexOf('${esc(String(contains).slice(0, 200))}', [System.StringComparison]::OrdinalIgnoreCase) -ge 0 }); `;
+    // A full bounded scan with fewer than n+1 matches cannot prove completeness.
+    // Private process signal: exit 65 with empty streams, never diagnostic text.
+    script += `if ($scanned -eq ${n + 1} -and @($evts).Count -le ${n}) { exit 65 }; `;
+  }
+  script += `$evts = @($evts | Sort-Object TimeCreated -Descending); `;
+  script += `ConvertTo-Json -InputObject @($evts | Select-Object TimeCreated,Level,ProviderName,@{n='Message';e={$_.Message}}) -Compress -Depth 2`;
   return script;
 }
 
@@ -292,6 +300,7 @@ export function runMacLogStream(args, limit, timeoutMs = 30000, spawnFn = spawn)
   return new Promise((resolve, reject) => {
     let settled = false;
     let child;
+    const startedAt = new Date().toISOString();
     try {
       child = spawnFn('log', args, {
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -307,15 +316,31 @@ export function runMacLogStream(args, limit, timeoutMs = 30000, spawnFn = spawn)
     let totalCount = 0;
     let stderr = '';
 
-    const timer = setTimeout(() => {
+    const timer = setTimeout(async () => {
       if (settled) return;
       settled = true;
       try {
-        child.kill('SIGKILL');
+        await terminateSessionTreeAsync(child, {
+          platform: 'darwin',
+          force: true,
+          graceMs: 0,
+          expectedStartedAt: startedAt,
+          expectedPath: 'log',
+          expectedCommandLine: args
+        });
+      } catch {}
+      try {
+        child.stdout?.destroy();
+      } catch {}
+      try {
+        child.stderr?.destroy();
       } catch {}
       const err = Object.assign(new Error('TIMEOUT'), { code: 'ETIMEDOUT' });
       reject(err);
     }, timeoutMs);
+    try {
+      timer.unref?.();
+    } catch {}
 
     child.stderr?.on('data', (d) => {
       if (stderr.length < 8192) stderr += String(d);
@@ -403,7 +428,7 @@ export function macLogArgs({
   }
   const lv = String(level || 'all').toLowerCase();
   if (lv === 'error') preds.push('messageType == "Error"');
-  else if (lv === 'warning') preds.push('messageType == "Fault" OR messageType == "Error"');
+  else if (lv === 'warning') preds.push('(messageType == "Fault" OR messageType == "Error")');
   else if (lv !== 'all' && lv !== 'info') throw new Error('LOG_LEVEL_INVALID');
   if (contains)
     preds.push(`eventMessage CONTAINS[c] "${String(contains).slice(0, 200).replace(/"/g, '')}"`);
@@ -426,6 +451,7 @@ const CLEAN_LOG_CODES = new Set([
   'LOG_UNIT_INVALID',
   'LOG_LEVEL_INVALID',
   'LOG_SINCE_INVALID',
+  'LOG_READ_FAILED',
   'UNAUTHORIZED'
 ]);
 
@@ -523,6 +549,8 @@ async function dispatchHelperResult(job, directError, invoke, isAvailable) {
     reply && typeof reply === 'object' ? /** @type {Record<string, any>} */ (reply) : null;
   if (!rec || rec.ok !== true) throw directError;
   const result = rec.result && typeof rec.result === 'object' ? rec.result : null;
+  if (result?.success === false && result.message === 'LOG_READ_FAILED')
+    throw new Error('LOG_READ_FAILED');
   if (!result || result.success !== true) throw directError;
   return result;
 }
@@ -536,10 +564,14 @@ function parseHelperLogTail(platform, outputTail) {
   const text = String(outputTail || '');
   if (platform === 'win32') {
     try {
-      const v = JSON.parse(text.trim() || '[]');
-      return parseWinEvents(Array.isArray(v) ? v : [v]);
+      if (text.length > 8000) throw new Error('LOG_READ_FAILED');
+      const v = JSON.parse(text);
+      const rows = Array.isArray(v) ? v : [v];
+      if (rows.some((row) => !row || typeof row !== 'object' || Array.isArray(row) || !Object.hasOwn(row, 'Message')))
+        throw new Error('LOG_READ_FAILED');
+      return parseWinEvents(rows);
     } catch {
-      return [];
+      throw new Error('LOG_READ_FAILED');
     }
   }
   if (platform === 'darwin') return parseMacLogCompact(text);
@@ -548,11 +580,18 @@ function parseHelperLogTail(platform, outputTail) {
 
 async function runJsonPs(script) {
   const utf8Script = `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ${script}`;
-  const { stdout } = await run(
-    'powershell.exe',
-    ['-NoProfile', '-NonInteractive', '-Command', utf8Script],
-    { timeout: 30000, windowsHide: true, maxBuffer: 64 * 1024 * 1024 }
-  );
+  let stdout;
+  try {
+    ({ stdout } = await run(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', utf8Script],
+      { timeout: 30000, windowsHide: true, maxBuffer: 64 * 1024 * 1024 }
+    ));
+  } catch (e) {
+    if (e?.code === 65 && !String(e?.stdout || '').trim() && !String(e?.stderr || '').trim())
+      throw new Error('LOG_READ_FAILED', { cause: e });
+    throw e;
+  }
   const text = String(stdout || '')
     .replace(/^\uFEFF/, '')
     .trim();
@@ -587,7 +626,7 @@ async function serviceLogs(platform, { unit, lines = 100, since = null, level = 
     const { entries, truncated } = await runMacLogStream(args, limit, 30000);
     return { platform, unit: String(unit), entries, truncated };
   }
-  const args = journalArgs({ unit: String(unit), lines: lim, since, level });
+  const args = journalArgs({ unit: String(unit), lines: lim + 1, since, level });
   let stdout;
   try {
     ({ stdout } = await run('journalctl', args, { timeout: 30000, maxBuffer: 64 * 1024 * 1024 }));
@@ -643,7 +682,7 @@ async function systemLogQuery(
     unit,
     level,
     contains: String(contains || ''),
-    lines: lim,
+    lines: lim + 1,
     since
   });
   let stdout;
@@ -730,7 +769,9 @@ export function makeSystemLogHandlers(
             ? { entries: entries.slice(0, lim), truncated }
             : tailCapped(entries, lim);
         return completed({ platform, source, ...tail, privileged: true });
-      } catch {
+      } catch (helperError) {
+        if (helperError?.message === 'LOG_READ_FAILED')
+          return failed(new Error('LOG_READ_FAILED'));
         return failed(new Error('UNAUTHORIZED'));
       }
     }

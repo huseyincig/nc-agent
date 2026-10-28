@@ -83,60 +83,40 @@ export function findManagedChromium(dataDir) {
   return null;
 }
 
-// --- System Browser Discovery (diagnostics / existing-mode guidance) ---
+// Known installed executables only; never a registry command or daily profile.
 /**
  * @param {string} [preferred]
+ * @param {{platform?: string, env?: NodeJS.ProcessEnv}} [options]
  */
-export function findSystemBrowser(preferred = 'auto') {
-  const plat = os.platform();
+export function findSystemBrowser(preferred = 'auto', { platform = process.platform, env = process.env } = {}) {
+  const plat = platform;
   /** @type {Array<{path: string, type: string}>} */
   const candidates = [];
 
   if (plat === 'win32') {
-    const progFiles86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)';
-    const progFiles = process.env.ProgramFiles || 'C:\\Program Files';
-    const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+    if (preferred !== 'edge' && preferred !== 'chrome') return null;
+    const progFiles86 = env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)';
+    const progFiles = env.ProgramFiles || 'C:\\Program Files';
+    const localAppData = env.LOCALAPPDATA || path.win32.join(os.homedir(), 'AppData', 'Local');
 
     const edgePaths = [
-      path.join(progFiles86, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
-      path.join(progFiles, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
-      path.join(localAppData, 'Microsoft', 'Edge', 'Application', 'msedge.exe')
+      path.win32.join(progFiles86, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+      path.win32.join(progFiles, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+      path.win32.join(localAppData, 'Microsoft', 'Edge', 'Application', 'msedge.exe')
     ];
     const chromePaths = [
-      path.join(progFiles, 'Google', 'Chrome', 'Application', 'chrome.exe'),
-      path.join(progFiles86, 'Google', 'Chrome', 'Application', 'chrome.exe'),
-      path.join(localAppData, 'Google', 'Chrome', 'Application', 'chrome.exe')
+      path.win32.join(progFiles, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      path.win32.join(progFiles86, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      path.win32.join(localAppData, 'Google', 'Chrome', 'Application', 'chrome.exe')
     ];
 
     if (preferred === 'edge') {
       candidates.push(...edgePaths.map((p) => ({ path: p, type: 'edge' })));
-      candidates.push(...chromePaths.map((p) => ({ path: p, type: 'chrome' })));
     } else if (preferred === 'chrome') {
-      candidates.push(...chromePaths.map((p) => ({ path: p, type: 'chrome' })));
-      candidates.push(...edgePaths.map((p) => ({ path: p, type: 'edge' })));
-    } else {
-      // Default on Windows: Prefer Edge then Chrome
-      candidates.push(...edgePaths.map((p) => ({ path: p, type: 'edge' })));
       candidates.push(...chromePaths.map((p) => ({ path: p, type: 'chrome' })));
     }
   } else if (plat === 'darwin') {
-    const edgePaths = ['/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge'];
-    const chromePaths = [
-      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-      '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
-      '/Applications/Chromium.app/Contents/MacOS/Chromium'
-    ];
-
-    if (preferred === 'edge') {
-      candidates.push(...edgePaths.map((p) => ({ path: p, type: 'edge' })));
-      candidates.push(...chromePaths.map((p) => ({ path: p, type: 'chrome' })));
-    } else if (preferred === 'chrome') {
-      candidates.push(...chromePaths.map((p) => ({ path: p, type: 'chrome' })));
-      candidates.push(...edgePaths.map((p) => ({ path: p, type: 'edge' })));
-    } else {
-      candidates.push(...chromePaths.map((p) => ({ path: p, type: 'chrome' })));
-      candidates.push(...edgePaths.map((p) => ({ path: p, type: 'edge' })));
-    }
+    candidates.push({ path: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', type: 'chrome' });
   } else {
     // Linux
     const chromePaths = [
@@ -158,9 +138,9 @@ export function findSystemBrowser(preferred = 'auto') {
 
   for (const c of candidates) {
     try {
-      if (fs.existsSync(c.path)) {
-        return c;
-      }
+      if (!fs.statSync(c.path).isFile()) continue;
+      fs.accessSync(c.path, fs.constants.R_OK | (plat === 'win32' ? 0 : fs.constants.X_OK));
+      return c;
     } catch {}
   }
   return null;

@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { ncLayout } from './nc-paths.mjs';
-import { normalizeTimingMs, restartInterruptionPayload } from './shell-runner.mjs';
+import { normalizeTimingMs, restartInterruptionPayload, isDangerousJobId } from './shell-runner.mjs';
 import { browserAuditSummary } from '../browser/browser-manager.mjs';
 import { redactDiagnosticsSecrets } from '../diagnostics/diagnostics-ops.mjs';
 import {
@@ -93,9 +93,10 @@ export function agentInstallMode(env = process.env) {
 }
 
 /**
- * Existing per-user work folders (Desktop, Documents) for central's default
- * roots seeding on user-mode hosts. Existing dirs only, nonexistent names
- * omitted so central never seeds dead paths. Sync readdir-free checks.
+ * Existing per-user work folders (Desktop, Documents, Downloads) for
+ * central's install-alignment roots seeding on user-mode hosts. Existing
+ * dirs only, nonexistent names omitted so central never seeds dead paths.
+ * Sync readdir-free checks.
  * @param {string} [platform]
  * @param {string} [home]
  */
@@ -112,7 +113,8 @@ export function discoverUserFolders(platform = process.platform, home = null) {
   const out = {};
   for (const [key, parts] of [
     ['desktop', ['Desktop']],
-    ['documents', ['Documents']]
+    ['documents', ['Documents']],
+    ['downloads', ['Downloads']]
   ]) {
     const p = path.join(base, ...parts);
     try {
@@ -120,6 +122,28 @@ export function discoverUserFolders(platform = process.platform, home = null) {
     } catch {}
   }
   return out;
+}
+
+/**
+ * Authorized-directory facts for central's install-alignment roots seeding:
+ * the operator HOME plus the OS temp dir. Best-effort (null when the OS
+ * call fails); central treats missing facts as absent candidates and never
+ * guesses. Pure except the two OS queries. Sync.
+ * @param {{homedir?: (() => string)|null, tmpdir?: (() => string)|null}} [options]
+ */
+export function installDirFacts({ homedir = null, tmpdir = null } = {}) {
+  let home_dir = null,
+    temp_dir = null;
+  try {
+    home_dir = (homedir || os.homedir)();
+  } catch {}
+  try {
+    temp_dir = (tmpdir || os.tmpdir)();
+  } catch {}
+  return {
+    home_dir: typeof home_dir === 'string' && home_dir.length > 0 ? home_dir : null,
+    temp_dir: typeof temp_dir === 'string' && temp_dir.length > 0 ? temp_dir : null
+  };
 }
 
 let auditWrites = 0;
@@ -599,17 +623,31 @@ export function registrationStateForClient(state, clientId) {
 }
 
 export async function readState(stateFile = process.env.NC_STATE_FILE || layout.stateFile, clientId = process.env.NC_CLIENT_ID || os.hostname()) {
+  let state;
   try {
-    const state = JSON.parse(await fs.readFile(stateFile, 'utf8'));
+    state = JSON.parse(await fs.readFile(stateFile, 'utf8'));
     state.offsets ||= {};
     state.jobs ||= {};
     state.pendingResults ||= {};
     state.retirement = normalizeRetirementCandidate(state.retirement);
     Object.assign(state, registrationStateForClient(state, clientId));
-    return state;
   } catch {
-    return freshState();
+    state = freshState();
   }
+  for (const item of await drainPendingResults({ stateFile })) {
+    const jobId = item.jobId;
+    if (typeof jobId !== 'string' || !jobId || isDangerousJobId(jobId)) continue;
+    const record = state.jobs[jobId];
+    // A persisted terminal record is an acknowledgement, even if a crash
+    // occurred before its spool file was removed.
+    if (record && !['claimed', 'running', 'result_pending'].includes(record.status)) {
+      await item.remove();
+      continue;
+    }
+    state.pendingResults[jobId] = item.result;
+    state.jobs[jobId] = { ...record, status: 'result_pending' };
+  }
+  return state;
 }
 
 export let stateWriteChain = Promise.resolve();
@@ -621,15 +659,19 @@ export let stateWriteChain = Promise.resolve();
 export async function writeState(state, stateFile = process.env.NC_STATE_FILE || layout.stateFile) {
   const persist = async () => {
     await fs.mkdir(path.dirname(stateFile), { recursive: true });
-    // Remove the single-file state.pendingResults dictionary from persisted state:
+    // Publish results before the result_pending state; never acknowledge a
+    // completed job locally while its result exists only in memory.
     const { pendingResults, ...toPersist } = state || {};
+    for (const [jobId, result] of Object.entries(pendingResults || {})) {
+      await recordPendingResult(jobId, result, { stateFile });
+    }
     // Unique tmp name per write: concurrent processes (e.g. parallel test
     // runners) sharing one state file must never share one tmp path, or a
     // rename by one writer deletes the other's tmp -> ENOENT on rename.
     const tmp = `${stateFile}.${process.pid}.${Date.now()}.${Math.floor(Math.random() * 1000000)}.tmp`;
     // V-32.5: 'wx' (O_CREAT|O_EXCL) fails with EEXIST instead of following
     // a planted symlink at the tmp path (default 'w' truncates through it).
-    await fs.writeFile(tmp, `${JSON.stringify(toPersist, null, 2)}\n`, { mode: 0o640, flag: 'wx' });
+    await fs.writeFile(tmp, `${JSON.stringify(toPersist, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
     try {
       await fs.rename(tmp, stateFile);
     } catch (error) {
@@ -735,7 +777,15 @@ export function confirmCompletedUpdates(state, runningVersion) {
 export function markInterruptedJobs(state) {
   let changed = false;
   for (const [jobId, record] of Object.entries(state.jobs || {})) {
-    if (record?.status === 'running' && !state.pendingResults[jobId]) {
+    if (record?.status === 'claimed' && !record.started_at && !state.pendingResults[jobId]) {
+      // Admission has no execution side effects. Release boot-stale claims,
+      // not live in-process claims, so an authenticated resend may admit them.
+      if (record.cancelRequested) record.status = 'cancelled';
+      else delete state.jobs[jobId];
+      changed = true;
+      continue;
+    }
+    if ((record?.status === 'running' || (record?.status === 'claimed' && record.started_at)) && !state.pendingResults[jobId]) {
       // Restart-safety classification (shell-runner owns the taxonomy): the
       // marker embeds safe_to_retry/suggested_action so the control-plane
       // result-mapper can tell the model whether re-issuing is safe.
@@ -799,6 +849,16 @@ export function pendingResultsDir(options = {}) {
   return path.join(path.dirname(defaultStateFile), 'pending-results');
 }
 
+/** Remove a result only after its acknowledgement has been persisted.
+ * @param {string} jobId @param {object|string} [options]
+ */
+export async function removePendingResult(jobId, options = {}) {
+  const file = path.join(pendingResultsDir(options), `${encodeURIComponent(jobId)}.json`);
+  await fs.unlink(file).catch(error => {
+    if (error.code !== 'ENOENT') throw error;
+  });
+}
+
 /**
  * Atomically writes a job result to the pending-results directory.
  * Limits total files in the directory to 500 files by pruning oldest.
@@ -811,12 +871,15 @@ export function pendingResultsDir(options = {}) {
 export async function recordPendingResult(jobId, result, options = {}) {
   const dir = pendingResultsDir(options);
   await fs.mkdir(dir, { recursive: true });
+  const safeName = encodeURIComponent(jobId);
+  const targetName = `${safeName}.json`;
 
-  // Limit to 500 files: prune oldest if limit reached
+  // Only a new result increases occupancy. An overwrite must keep the old
+  // result intact until atomic replacement, including at the capacity limit.
   try {
     const entries = await fs.readdir(dir);
     const jsonFiles = entries.filter((f) => f.endsWith('.json') && !f.endsWith('.tmp'));
-    if (jsonFiles.length >= MAX_PENDING_RESULTS) {
+    if (!jsonFiles.includes(targetName) && jsonFiles.length >= MAX_PENDING_RESULTS) {
       const stats = await Promise.all(
         jsonFiles.map(async (file) => {
           try {
@@ -835,8 +898,7 @@ export async function recordPendingResult(jobId, result, options = {}) {
     }
   } catch {}
 
-  const safeName = encodeURIComponent(jobId);
-  const targetPath = path.join(dir, `${safeName}.json`);
+  const targetPath = path.join(dir, targetName);
   const tmpPath = path.join(
     dir,
     `${safeName}.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}.tmp`
@@ -850,7 +912,7 @@ export async function recordPendingResult(jobId, result, options = {}) {
 
   // V-32.5: 'wx' (O_CREAT|O_EXCL) fails with EEXIST instead of following a
   // planted symlink at the tmp path (default 'w' truncates through it).
-  await fs.writeFile(tmpPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o640, flag: 'wx' });
+  await fs.writeFile(tmpPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
   try {
     await fs.rename(tmpPath, targetPath);
   } catch (error) {

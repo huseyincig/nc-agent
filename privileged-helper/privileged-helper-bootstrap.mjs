@@ -62,14 +62,16 @@ export async function fetchPrivilegedHelperBootstrap({
   // Unique tmp per writer: concurrent bootstraps must never share one tmp
   // path ('wx' would fail the loser with EEXIST). Mirrors ensureDeviceKey.
   const tmp = `${publicKeyFile}.tmp-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
-  await fs.writeFile(tmp, body.public_key_pem, { mode: 0o600, flag: 'wx' });
+  // L01a-18: readiness requires the public key to be world-readable
+  // (0644); 0600 here failed the readiness gate on every bootstrap.
+  await fs.writeFile(tmp, body.public_key_pem, { mode: 0o644, flag: 'wx' });
   try {
     await fs.rename(tmp, publicKeyFile);
   } catch (error) {
     await fs.rm(tmp, { force: true });
     throw error;
   }
-  // V-32.9: no post-rename chmod. rename(2) preserves the tmp mode (0600
+  // V-32.9: no post-rename chmod. rename(2) preserves the tmp mode (0644
   // above); a chmod after rename re-opens the path and is vulnerable to a
   // symlink swap between rename and chmod (TOCTOU).
   return {

@@ -5,11 +5,15 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { policyExtraRoots } from '../policy/host-policy.mjs';
 import { isSensitivePath } from './sensitive-paths.mjs';
+import { isAccessDeniedError } from '../structured-ops/structured-ops.mjs';
 import { MutationError, authorizeMutationPath, denySensitivePath, err, forbidAgentTreeWrite, isNoEnt, lstatOrNull, mutationTargets, normCase, normalizeMutationPath, realAllowedRoots, within } from './path-auth.mjs';
 import { normalizeServiceMode } from '../client/shell-runner.mjs';
 
 
 export const MAX_WRITE_BYTES = 1024 * 1024;
+
+// Only actual remove failures carry a completed delete preflight.
+const deleteRemovalTargets = new WeakMap();
 
 /**
  * @param {unknown} o @param {string} k
@@ -26,13 +30,27 @@ function optionalBoolean(o, key, errorCode) {
 }
 
 /**
- * @param {string} target @param {{roots?: Array<string>, fsApi: typeof import('node:fs/promises'), pathApi: typeof import('node:path')}} options
+ * @param {string} target @param {{roots?: Array<string>, fsApi: typeof import('node:fs/promises'), pathApi: typeof import('node:path'), treeBan?: any}} options
  */
 async function authorizeLeafParent(target, options) {
   const { fsApi = fs, pathApi = path } = options;
   const normalized = normalizeMutationPath(target, { pathApi });
+  denySensitivePath(normalized, pathApi);
   const parent = pathApi.dirname(normalized);
   const auth = await authorizeMutationPath(parent, options);
+  // Parent authorization alone does not cover a protected final component.
+  const resolvedTarget = pathApi.resolve(auth.real_ancestor, pathApi.relative(auth.ancestor, normalized));
+  denySensitivePath(resolvedTarget, pathApi);
+  let realTarget = resolvedTarget;
+  try {
+    realTarget = await fsApi.realpath(normalized);
+  } catch (e) {
+    if (!isNoEnt(e)) throw e;
+  }
+  denySensitivePath(realTarget, pathApi);
+  if (options.treeBan?.appRoot) {
+    forbidAgentTreeWrite(options.treeBan.tool || 'mutation', [normalized, resolvedTarget, realTarget], { ...options.treeBan, pathApi });
+  }
   return { ...auth, path: normalized, parent };
 }
 /**
@@ -66,9 +84,10 @@ async function readExactHandle(rh, buf, length, position) {
  * style; EEXIST on create-exclusive maps to DESTINATION_EXISTS. On
  * platforms where O_NOFOLLOW is unsupported (Windows: EINVAL/ENOSYS),
  * fall back to the string flag — the lstat gate above still applies.
+ * A null fallback forbids downgrading flags required for safe hash reads.
  * @param {string} target
  * @param {number} numericFlags
- * @param {string} fallbackFlag
+ * @param {string|null} fallbackFlag
  * @param {{fsApi?: typeof import('node:fs/promises')}} [options]
  */
 async function openNoFollow(target, numericFlags, fallbackFlag, { fsApi = fs } = {}) {
@@ -83,7 +102,7 @@ async function openNoFollow(target, numericFlags, fallbackFlag, { fsApi = fs } =
     // codes; a plain Error here would fall through to MUTATION_IO_ERROR).
     const code = /** @type {NodeJS.ErrnoException} */ (openError).code;
     if (code === 'ELOOP' || code === 'EMLINK') err('PATH_TYPE_NOT_SUPPORTED');
-    if ((code === 'EINVAL' || code === 'ENOSYS' || code === 'EOPNOTSUPP') && fsConstants.O_NOFOLLOW) {
+    if (fallbackFlag !== null && (code === 'EINVAL' || code === 'ENOSYS' || code === 'EOPNOTSUPP') && fsConstants.O_NOFOLLOW) {
       return await fsApi.open(target, fallbackFlag);
     }
     throw openError;
@@ -96,11 +115,12 @@ export async function shaFile(file, fsApi) {
   const h = crypto.createHash('sha256');
   const handle = await openNoFollow(
     file,
-    fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0),
-    'r',
+    fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0) | (fsConstants.O_NONBLOCK || 0),
+    null,
     { fsApi }
   );
   try {
+    if (!(await handle.stat()).isFile()) err('PATH_TYPE_NOT_SUPPORTED');
     const buffer = Buffer.allocUnsafe(64 * 1024);
     let position = 0;
     while (true) {
@@ -232,7 +252,21 @@ async function forbidConfiguredRootTarget(
   { roots, allowAll = false, fsApi = fs, pathApi = path } = {}
 ) {
   const normalized = normalizeMutationPath(target, { pathApi });
-  if (allowAll === true && !(roots || []).length) return [];
+  if (allowAll === true) {
+    if (!(roots || []).length) return [];
+    try {
+      const realRoots = await realAllowedRoots(roots, fsApi);
+      const configured = (roots || []).map((root) =>
+        normCase(pathApi.normalize(String(root)), pathApi)
+      );
+      const t = normCase(normalized, pathApi);
+      if (configured.includes(t) || realRoots.some((root) => t === normCase(root, pathApi)))
+        err('ROOT_MUTATION_FORBIDDEN');
+      return realRoots;
+    } catch {
+      return [];
+    }
+  }
   const realRoots = await realAllowedRoots(roots, fsApi);
   const configured = (roots || []).map((root) =>
     normCase(pathApi.normalize(String(root)), pathApi)
@@ -335,7 +369,7 @@ export async function fileWriteMutation(
     // the parent resolves outside the gated tree and trips the ban here,
     // before anything is created (P13-D5).
     const parent = pathApi.dirname(normalized);
-    let parentAuth = await authorizeMutationPath(parent, options);
+    let parentAuth = await authorizeLeafParent(normalized, options);
     rootTargetForbidden(normalized, parentAuth.real_roots, pathApi);
     let st = await lstatOrNull(normalized, fsApi);
     if (st && st.isSymbolicLink()) err('PATH_SYMLINK_NOT_ALLOWED_FOR_WRITE');
@@ -370,7 +404,7 @@ export async function fileWriteMutation(
       // PARENT_NOT_FOUND on a standard write; re-authorize afterwards so
       // the ban still sees the final resolved ancestor.
       await fsApi.mkdir(parent, { recursive: true });
-      parentAuth = await authorizeMutationPath(parent, options);
+      parentAuth = await authorizeLeafParent(normalized, options);
       rootTargetForbidden(normalized, parentAuth.real_roots, pathApi);
       st = await lstatOrNull(normalized, fsApi);
       if (st) err('FILE_EXISTS');
@@ -947,6 +981,8 @@ export async function transferWriteMutation(payload, { roots, allowAll = false, 
  * @param {typeof import('node:fs/promises')} [options.fsApi]
  * @param {any} [options.pathApi]
  * @param {string} [options.platform]
+ * @param {any} [options.cwd]
+ * @param {any} [options.homedir]
  * @param {{tool?: string, appRoot?: string|null, workspace?: string|null, pathApi?: any}|null} [options.treeBan]
  */
 export async function fileDeleteMutation(
@@ -960,57 +996,105 @@ export async function fileDeleteMutation(
     homedir
   });
   const options = { roots, allowAll, fsApi, pathApi, treeBan, cwd, homedir };
-  await forbidConfiguredRootTarget(target, options);
-  const auth = await authorizeLeafParent(target, options);
-  rootTargetForbidden(target, auth.real_roots, pathApi);
-  return serialized(normCase(target, pathApi), async () => {
+  let removeStarted = false;
+  try {
     await forbidConfiguredRootTarget(target, options);
-    const leafNow = await authorizeLeafParent(target, options);
-    rootTargetForbidden(target, leafNow.real_roots, pathApi);
-    const st = await lstatOrNull(target, fsApi);
-    if (!st) err('FILE_NOT_FOUND');
+    const auth = await authorizeLeafParent(target, options);
+    rootTargetForbidden(target, auth.real_roots, pathApi);
+    return await serialized(normCase(target, pathApi), async () => {
+      await forbidConfiguredRootTarget(target, options);
+      const leafNow = await authorizeLeafParent(target, options);
+      rootTargetForbidden(target, leafNow.real_roots, pathApi);
+      const st = await lstatOrNull(target, fsApi);
+      if (!st) err('FILE_NOT_FOUND');
 
-    const parent = leafNow.parent;
-    const parentStatBefore = await lstatOrNull(parent, fsApi);
-    if (!parentStatBefore || parentStatBefore.isSymbolicLink() || !parentStatBefore.isDirectory()) {
-      err('PATH_NOT_ALLOWED', { path: target, configured_roots: [...leafNow.real_roots] });
-    }
-    let validatedParentReal;
-    try {
-      validatedParentReal = await fsApi.realpath(parent);
-    } catch {
-      err('PATH_NOT_ALLOWED', { path: target, configured_roots: [...leafNow.real_roots] });
-    }
-
-    const verifyParentBeforeRm = async () => {
-      await verifyParentStable(parent, validatedParentReal, {
-        ...options,
-        realRoots: leafNow.real_roots,
-        target,
-        tool: 'file_delete'
-      });
-    };
-
-    if (st.isDirectory() && !st.isSymbolicLink()) {
-      if (!recursive) err('DIRECTORY_RECURSIVE_REQUIRED');
-      await verifyParentBeforeRm();
-      const targetStatNow = await lstatOrNull(target, fsApi);
-      if (!targetStatNow || targetStatNow.isSymbolicLink() || !targetStatNow.isDirectory()) {
-        err('PATH_TYPE_NOT_SUPPORTED');
+      const parent = leafNow.parent;
+      const parentStatBefore = await lstatOrNull(parent, fsApi);
+      if (!parentStatBefore || parentStatBefore.isSymbolicLink() || !parentStatBefore.isDirectory()) {
+        err('PATH_NOT_ALLOWED', { path: target, configured_roots: [...leafNow.real_roots] });
       }
-      await fsApi.rm(target, { recursive: true, force: false });
-      return { path: target, type: 'directory', recursive: true, deleted: true };
+      let validatedParentReal;
+      try {
+        validatedParentReal = await fsApi.realpath(parent);
+      } catch {
+        err('PATH_NOT_ALLOWED', { path: target, configured_roots: [...leafNow.real_roots] });
+      }
+
+      const verifyParentBeforeRm = async () => {
+        await verifyParentStable(parent, validatedParentReal, {
+          ...options,
+          realRoots: leafNow.real_roots,
+          target,
+          tool: 'file_delete'
+        });
+      };
+
+      if (st.isDirectory() && !st.isSymbolicLink()) {
+        if (!recursive) err('DIRECTORY_RECURSIVE_REQUIRED');
+        // Preflight the entire deletion before the first side effect. rm does not
+        // follow symlink children, but protected names and agent ancestors still
+        // must not be removed as part of a larger otherwise-allowed tree.
+        try {
+          const realTarget = await fsApi.realpath(target);
+          if (treeBan?.appRoot && [target, realTarget].some((base) => within(treeBan.appRoot, base, pathApi))) {
+            err('AGENT_TREE_WRITE_FORBIDDEN');
+          }
+          const pending = [target];
+          while (pending.length) {
+            const current = pending.pop();
+            denySensitivePath(current, pathApi);
+            const currentStat = await fsApi.lstat(current);
+            let realCurrent = current;
+            try {
+              realCurrent = await fsApi.realpath(current);
+            } catch (e) {
+              // A dangling child link is removed, never followed by recursive rm.
+              if (!currentStat.isSymbolicLink() || !isNoEnt(e)) throw e;
+            }
+            denySensitivePath(realCurrent, pathApi);
+            if (treeBan?.appRoot) forbidAgentTreeWrite('file_delete', [current, realCurrent], { ...treeBan, pathApi });
+            if (currentStat.isDirectory() && !currentStat.isSymbolicLink()) {
+              await authorizeMutationPath(current, options);
+              const rows = await fsApi.readdir(current);
+              for (const name of rows) pending.push(pathApi.join(current, name));
+            }
+          }
+        } catch (e) {
+          if (e instanceof MutationError) throw e;
+          // An incomplete protected-subtree check is a policy denial, never an
+          // EACCES/EPERM signal to retry the deletion with a privileged helper.
+          err('PATH_NOT_ALLOWED', { path: target, configured_roots: [...leafNow.real_roots] });
+        }
+        await verifyParentBeforeRm();
+        const targetStatNow = await lstatOrNull(target, fsApi);
+        if (!targetStatNow || targetStatNow.isSymbolicLink() || !targetStatNow.isDirectory()) {
+          err('PATH_TYPE_NOT_SUPPORTED');
+        }
+        removeStarted = true;
+        await fsApi.rm(target, { recursive: true, force: false });
+        return { path: target, type: 'directory', recursive: true, deleted: true };
+      }
+      if (!st.isFile() && !st.isSymbolicLink()) err('PATH_TYPE_NOT_SUPPORTED');
+      await verifyParentBeforeRm();
+      removeStarted = true;
+      await fsApi.unlink(target);
+      return {
+        path: target,
+        type: st.isSymbolicLink() ? 'symlink' : 'file',
+        recursive: false,
+        deleted: true
+      };
+    });
+  } catch (e) {
+    // Metadata/I/O failures cannot authorize an incomplete recursive preflight.
+    if (recursive && !removeStarted && !(e instanceof MutationError)) {
+      err('PATH_NOT_ALLOWED', { path: target, configured_roots: [...(roots || [])] });
     }
-    if (!st.isFile() && !st.isSymbolicLink()) err('PATH_TYPE_NOT_SUPPORTED');
-    await verifyParentBeforeRm();
-    await fsApi.unlink(target);
-    return {
-      path: target,
-      type: st.isSymbolicLink() ? 'symlink' : 'file',
-      recursive: false,
-      deleted: true
-    };
-  });
+    if (isAccessDeniedError(e)) {
+      if (removeStarted) deleteRemovalTargets.set(e, target);
+    }
+    throw e;
+  }
 }
 
 /**
@@ -1344,8 +1428,9 @@ function ambiguousEditError(file, oldText, occurrences, content, batchInfo) {
  * @param {typeof import('node:fs/promises')} [options.fsApi]
  * @param {any} [options.pathApi]
  * @param {{tool?: string, appRoot?: string|null, workspace?: string|null, pathApi?: any}|null} [options.treeBan]
+ * @param {string} [options.platform]
  */
-export async function fileEditMutation(payload, { roots, allowAll = false, fsApi = fs, pathApi = path, treeBan = null } = {}) {
+export async function fileEditMutation(payload, { roots, allowAll = false, fsApi = fs, pathApi = path, treeBan = null, platform = process.platform } = {}) {
   const normalized = normalizeMutationPath(/** @type {string} */ (payload?.path), { pathApi });
   return serialized(normCase(normalized, pathApi), async () => {
     const options = { roots, allowAll, fsApi, pathApi, treeBan };
@@ -1355,6 +1440,8 @@ export async function fileEditMutation(payload, { roots, allowAll = false, fsApi
     if (!st) err('FILE_NOT_FOUND');
     if (st.isSymbolicLink()) err('PATH_SYMLINK_NOT_ALLOWED_FOR_WRITE');
     if (!st.isFile()) err('PATH_TYPE_NOT_SUPPORTED');
+    const parentOptions = { ...options, realRoots: leaf.real_roots, target: normalized, tool: 'file_edit' };
+    await verifyParentStable(leaf.parent, leaf.real_ancestor, parentOptions);
     const expectedSha = validateSha(payload?.expected_sha256, hasOwn(payload, 'expected_sha256'));
     const expectedMtime =
       payload?.expected_mtime === undefined ? null : String(payload.expected_mtime);
@@ -1364,6 +1451,7 @@ export async function fileEditMutation(payload, { roots, allowAll = false, fsApi
       const actual = [String(st.mtimeMs), st.mtime?.toISOString?.()].filter(Boolean);
       if (!actual.includes(expectedMtime)) err('FILE_MTIME_MISMATCH');
     }
+    await verifyParentStable(leaf.parent, leaf.real_ancestor, parentOptions);
     const before = await fsApi.readFile(normalized, 'utf8');
     const bytesBefore = Buffer.byteLength(before);
     // Batch XOR single: `edits[]` runs atomically, legacy expected_text/
@@ -1415,13 +1503,22 @@ export async function fileEditMutation(payload, { roots, allowAll = false, fsApi
     if (dry || !changed) return out;
     const tmp = normalized + `.nc-edit-${Date.now()}-${Math.floor(Math.random() * 1e6)}.tmp`;
     try {
+      await verifyParentStable(leaf.parent, leaf.real_ancestor, parentOptions);
       await fsApi.writeFile(tmp, after, { encoding: 'utf8', flag: 'wx' });
+      await verifyParentStable(leaf.parent, leaf.real_ancestor, parentOptions);
       await fsyncTempFile(tmp, fsApi);
+      // L01a-6: preserve the original mode on the replacement (mirror
+      // fileWriteMutation): without this every edit resets the file to
+      // the process umask (e.g. 0600 secrets become 0644-readable).
+      await verifyParentStable(leaf.parent, leaf.real_ancestor, parentOptions);
+      if (platform !== 'win32' && st && Number.isFinite(st.mode)) await fsApi.chmod(tmp, st.mode & 0o7777);
+      await verifyParentStable(leaf.parent, leaf.real_ancestor, parentOptions);
       await fsApi.rename(tmp, normalized);
     } catch (e) {
       // A failed edit must not leave its temp sibling behind: the next
       // attempt reuses a fresh unique name, but orphans accumulate.
       try {
+        await verifyParentStable(leaf.parent, leaf.real_ancestor, parentOptions);
         await fsApi.rm(tmp, { force: true });
       } catch {}
       throw e;
@@ -1542,6 +1639,148 @@ export function unifiedDiff(before, after) {
 }
 
 /**
+ * @param {unknown} job
+ */
+function extractPrivilegedAuthorization(job) {
+  if (!job || typeof job !== 'object' || Array.isArray(job)) return null;
+  const rec = /** @type {Record<string, unknown>} */ (job);
+  for (const key of ['privileged_authorization', 'privileged_envelope']) {
+    const v = rec[key];
+    if (v && typeof v === 'object' && !Array.isArray(v)) return /** @type {Record<string, unknown>} */ (v);
+  }
+  const p = /** @type {Record<string, unknown>} */ (rec.request_payload || rec.payload || {});
+  for (const key of ['privileged_authorization', 'privileged_envelope']) {
+    const v = p[key];
+    if (v && typeof v === 'object' && !Array.isArray(v)) return /** @type {Record<string, unknown>} */ (v);
+  }
+  return null;
+}
+
+/**
+ * @param {object} options
+ * @param {string} options.tool
+ * @param {Record<string, unknown>} options.payload
+ * @param {unknown} options.job
+ * @param {((req: unknown) => Promise<unknown>)|null} [options.invokePrivilegedHelper]
+ * @param {(() => boolean)|null} [options.isPrivilegedHelperAvailable]
+ * @param {Array<string>} options.roots
+ * @param {boolean} options.allowAll
+ * @param {unknown} options.directError
+ */
+async function dispatchHelperMutation({
+  tool,
+  payload,
+  job,
+  invokePrivilegedHelper,
+  isPrivilegedHelperAvailable,
+  roots,
+  allowAll,
+  directError
+}) {
+  let available = typeof invokePrivilegedHelper === 'function';
+  if (available && typeof isPrivilegedHelperAvailable === 'function') {
+    try {
+      available = isPrivilegedHelperAvailable();
+    } catch {
+      available = false;
+    }
+  }
+  if (!available) throw directError;
+
+  const authorization = extractPrivilegedAuthorization(job);
+  const action =
+    tool === 'file_write'
+      ? 'write'
+      : tool === 'file_edit'
+        ? 'edit'
+        : tool === 'file_move'
+          ? 'move'
+          : tool === 'file_copy'
+            ? 'copy'
+            : tool === 'file_delete'
+              ? 'delete'
+              : tool === 'directory_create'
+                ? 'mkdir'
+                : String(
+                    payload.action ||
+                      (payload.edits || payload.expected_text
+                        ? 'edit'
+                        : payload.destination
+                          ? 'move'
+                          : 'write')
+                  ).toLowerCase();
+
+  /** @type {Record<string, unknown>} */
+  const helperPayload = {
+    action,
+    ...payload,
+    allow_all: allowAll,
+    roots
+  };
+
+  if (action === 'delete') {
+    const verifiedTarget = deleteRemovalTargets.get(/** @type {object} */ (directError));
+    if (!verifiedTarget) err('PATH_NOT_ALLOWED');
+    // Bind dispatch to the exact normalized spelling that passed preflight.
+    // A signed payload is immutable: reject substitution, never rewrite it.
+    if (authorization?.payload != null) {
+      const signed = /** @type {Record<string, unknown>} */ (authorization.payload);
+      if (typeof signed !== 'object' || Array.isArray(signed) ||
+          String(signed.action || 'write').toLowerCase() !== 'delete' ||
+          (signed.path || signed.target) !== verifiedTarget ||
+          (signed.recursive === true) !== (payload.recursive === true)) {
+        err('PATH_NOT_ALLOWED', { path: verifiedTarget });
+      }
+    } else {
+      helperPayload.action = action;
+      helperPayload.path = verifiedTarget;
+    }
+  }
+
+  const req = authorization
+    ? { ...authorization, payload: authorization.payload ?? helperPayload }
+    : { operation: 'file_write', payload: helperPayload };
+
+  let reply;
+  try {
+    reply = await invokePrivilegedHelper(req);
+  } catch {
+    throw directError;
+  }
+  const rec = reply && typeof reply === 'object' ? /** @type {Record<string, any>} */ (reply) : null;
+  if (!rec || rec.ok !== true) throw directError;
+  const result = rec.result && typeof rec.result === 'object' ? rec.result : null;
+  if (!result || result.success !== true) throw directError;
+
+  if (action === 'delete') {
+    return { path: result.path || payload.path, deleted: true };
+  }
+  if (action === 'mkdir') {
+    return { path: result.path || payload.path, created: result.created ?? true };
+  }
+  if (action === 'move') {
+    return {
+      source: result.source || payload.source,
+      destination: result.destination || payload.destination
+    };
+  }
+  if (action === 'copy') {
+    return {
+      source: result.source || payload.source,
+      destination: result.destination || payload.destination
+    };
+  }
+  // write / edit
+  return {
+    path: result.path || payload.path,
+    bytes_written: result.bytes_written,
+    previous_sha256: result.previous_sha256 ?? null,
+    expected_sha256: result.expected_sha256 ?? payload.expected_sha256 ?? null,
+    sha256: result.sha256
+  };
+}
+
+/**
  * Consolidated file_mutate job handler (Phase 16.2).
  * Verifies optimistic concurrency (expected_sha256) before mutation,
  * then dispatches to file_write, file_edit, file_move, or file_copy.
@@ -1560,6 +1799,8 @@ export function unifiedDiff(before, after) {
  * @param {{tool?: string, appRoot?: string|null, workspace?: string|null, pathApi?: any}|null} [options.treeBan]
  * @param {string|null} [options.cwd] pre-flight relative-resolution base
  * @param {string} [options.homedir] `~` expansion base
+ * @param {((req: unknown) => Promise<unknown>)|null} [options.invokePrivilegedHelper]
+ * @param {(() => boolean)|null} [options.isPrivilegedHelperAvailable]
  */
 export async function fileMutateJob(job, options = {}) {
   const started = Date.now();
@@ -1585,38 +1826,6 @@ export async function fileMutateJob(job, options = {}) {
     const targetPath =
       typeof p.path === 'string' ? p.path : typeof p.source === 'string' ? p.source : '';
     if (!targetPath) err('PATH_REQUIRED');
-
-    // Optimistic concurrency guard (Phase 16.2):
-    // Before applying the mutation, hash the file (SHA256).
-    // If p.expected_sha256 is provided and does not match the actual hash, return a failure.
-    if (p.expected_sha256 !== undefined && p.expected_sha256 !== null) {
-      const expected = String(p.expected_sha256).toLowerCase().trim();
-      let actualHash = null;
-      try {
-        const normalized = normalizeMutationPath(targetPath, { pathApi });
-        actualHash = await shaFile(normalized, fsApi);
-      } catch {
-        actualHash = null;
-      }
-      if (!actualHash || actualHash.toLowerCase() !== expected) {
-        return {
-          status: 'failed',
-          exit_code: null,
-          stdout: '',
-          stderr: '',
-          error: 'EXPECTED_SHA256_MISMATCH',
-          reason: 'FILE_CHANGED_SINCE_READ',
-          duration_ms: Date.now() - started,
-          result_payload: {
-            error: 'EXPECTED_SHA256_MISMATCH',
-            code: 'EXPECTED_SHA256_MISMATCH',
-            reason: 'FILE_CHANGED_SINCE_READ',
-            expected_sha256: expected,
-            actual_sha256: actualHash
-          }
-        };
-      }
-    }
 
     const action = String(
       p.action || (p.edits || p.expected_text ? 'edit' : p.destination ? 'move' : 'write')
@@ -1653,17 +1862,72 @@ export async function fileMutateJob(job, options = {}) {
     contextRoots = [...roots];
     const mutOpts = { roots, allowAll, fsApi, pathApi, platform, treeBan: ban, cwd, homedir: options.homedir };
 
+    // Hashing is a sensitive read: policy, path and type gates must run first.
+    if (p.expected_sha256 !== undefined && p.expected_sha256 !== null) {
+      const normalized = normalizeMutationPath(targetPath, { pathApi, cwd, homedir: options.homedir });
+      denySensitivePath(normalized, pathApi);
+      const leaf = await authorizeLeafParent(normalized, mutOpts);
+      rootTargetForbidden(normalized, leaf.real_roots, pathApi);
+      const st = await lstatOrNull(normalized, fsApi);
+      if (st?.isSymbolicLink() || (st && !st.isFile())) err('PATH_TYPE_NOT_SUPPORTED');
+      await verifyParentStable(leaf.parent, leaf.real_ancestor, {
+        ...mutOpts, realRoots: leaf.real_roots, target: normalized, tool: toolName
+      });
+      const expected = String(p.expected_sha256).toLowerCase().trim();
+      let actualHash = null;
+      try {
+        actualHash = await shaFile(normalized, fsApi);
+      } catch (e) {
+        if (!isNoEnt(e)) throw e;
+      }
+      if (!actualHash || actualHash.toLowerCase() !== expected) {
+        return {
+          status: 'failed',
+          exit_code: null,
+          stdout: '',
+          stderr: '',
+          error: 'EXPECTED_SHA256_MISMATCH',
+          reason: 'FILE_CHANGED_SINCE_READ',
+          duration_ms: Date.now() - started,
+          result_payload: {
+            error: 'EXPECTED_SHA256_MISMATCH',
+            code: 'EXPECTED_SHA256_MISMATCH',
+            reason: 'FILE_CHANGED_SINCE_READ',
+            expected_sha256: expected,
+            actual_sha256: actualHash
+          }
+        };
+      }
+    }
+
     let res;
-    if (action === 'write') {
-      res = await fileWriteMutation(p, mutOpts);
-    } else if (action === 'edit') {
-      res = await fileEditMutation(p, mutOpts);
-    } else if (action === 'move') {
-      res = await fileMoveMutation(p, mutOpts);
-    } else if (action === 'copy') {
-      res = await fileCopyMutation(p, mutOpts);
-    } else {
-      err('INVALID_ACTION');
+    try {
+      if (action === 'write') {
+        res = await fileWriteMutation(p, mutOpts);
+      } else if (action === 'edit') {
+        res = await fileEditMutation(p, mutOpts);
+      } else if (action === 'move') {
+        res = await fileMoveMutation(p, mutOpts);
+      } else if (action === 'copy') {
+        res = await fileCopyMutation(p, mutOpts);
+      } else {
+        err('INVALID_ACTION');
+      }
+    } catch (directErr) {
+      if (isAccessDeniedError(directErr) && allowAll) {
+        res = await dispatchHelperMutation({
+          tool: toolName,
+          payload: p,
+          job: jobRecord,
+          invokePrivilegedHelper: options.invokePrivilegedHelper,
+          isPrivilegedHelperAvailable: options.isPrivilegedHelperAvailable,
+          roots,
+          allowAll,
+          directError: directErr
+        });
+      } else {
+        throw directErr;
+      }
     }
     return handlerOk(res, Date.now() - started);
   } catch (e) {
@@ -1682,6 +1946,8 @@ export async function fileMutateJob(job, options = {}) {
  * @param {string|null} [options.workspace] writable sanctuary inside the tree
  * @param {string|null} [options.cwd] pre-flight relative-resolution base
  * @param {string} [options.homedir] `~` expansion base
+ * @param {((req: unknown) => Promise<unknown>)|null} [options.invokePrivilegedHelper]
+ * @param {(() => boolean)|null} [options.isPrivilegedHelperAvailable]
  */
 
 export function makeMutationHandlers({
@@ -1693,9 +1959,20 @@ export function makeMutationHandlers({
   appRoot = null,
   workspace = null,
   cwd = process.cwd(),
-  homedir = undefined
+  homedir = undefined,
+  invokePrivilegedHelper = null,
+  isPrivilegedHelperAvailable = null
 } = {}) {
-  const options = { roots: writeRoots, fsApi, pathApi, platform, cwd, homedir };
+  const options = {
+    roots: writeRoots,
+    fsApi,
+    pathApi,
+    platform,
+    cwd,
+    homedir,
+    invokePrivilegedHelper,
+    isPrivilegedHelperAvailable
+  };
   const treeBan = { appRoot, workspace, pathApi };
   /** @type {(tool: string, fn: (payload: Record<string, unknown>, options: object) => unknown) => (job: unknown) => Promise<unknown>} */
   const wrap = (tool, fn) => async (job) => {
@@ -1720,7 +1997,25 @@ export function makeMutationHandlers({
       // read). The pre-check above uses treeBan (which carries pathApi as
       // call options, not as ban data).
       const ban = { appRoot, workspace, tool };
-      return handlerOk(await fn(payload, { ...options, roots, allowAll, treeBan: ban }), Date.now() - started);
+      try {
+        const res = await fn(payload, { ...options, roots, allowAll, treeBan: ban });
+        return handlerOk(res, Date.now() - started);
+      } catch (directErr) {
+        if (isAccessDeniedError(directErr) && allowAll) {
+          const helperRes = await dispatchHelperMutation({
+            tool,
+            payload,
+            job,
+            invokePrivilegedHelper,
+            isPrivilegedHelperAvailable,
+            roots,
+            allowAll,
+            directError: directErr
+          });
+          if (helperRes) return handlerOk(helperRes, Date.now() - started);
+        }
+        throw directErr;
+      }
     } catch (e) {
       return handlerFail(e, Date.now() - started, { configuredRoots: contextRoots });
     }
@@ -1742,7 +2037,9 @@ export function makeMutationHandlers({
         platform,
         appRoot,
         workspace,
-        treeBan
+        treeBan,
+        invokePrivilegedHelper,
+        isPrivilegedHelperAvailable
       })
   };
 }

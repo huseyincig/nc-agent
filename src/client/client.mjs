@@ -36,6 +36,7 @@ import {
   makeUpdateHandler,
   activatePreparedUpdate,
   activationInterlock,
+  activationBusyError,
   isActivationBusyError,
   markUpdateHealthy,
   updaterPolicy
@@ -64,7 +65,7 @@ import {
 import { invokePrivilegedHelper } from '../../privileged-helper/privileged-helper-ipc.mjs';
 import { linuxPrivilegedHelperReadiness } from '../../privileged-helper/privileged-helper-linux-readiness.mjs';
 import { darwinPrivilegedHelperReadiness } from '../../privileged-helper/privileged-helper-darwin-readiness.mjs';
-import { windowsPrivilegedHelperReadiness } from '../../privileged-helper/privileged-helper-windows-readiness.mjs';
+import { WINDOWS_PRIVILEGED_HELPER_AVAILABLE } from '../../privileged-helper/privileged-helper-windows-service.mjs';
 import {
   loadTransportSecret,
   computeTransportProof
@@ -83,6 +84,7 @@ import {
   browserUploadJob,
   browserHealth
 } from '../browser/browser-adapter.mjs';
+import { resolveBrowserRuntime, scheduleConvergenceRetry } from '../browser/browser-runtime.mjs';
 import { makeProcessHandlers, sweepOrphanedSessions, countLiveSessions } from '../process/process-sessions.mjs';
 import { makeServiceHandlers } from '../services/service-ops.mjs';
 import {
@@ -110,6 +112,7 @@ import {
   filesystemLayoutMetadata,
   agentInstallMode,
   discoverUserFolders,
+  installDirFacts,
   localAuditPayload,
   localAudit,
   compactTailedFile,
@@ -117,11 +120,14 @@ import {
   registrationStateForClient,
   readState,
   writeState,
+  removePendingResult,
   resetRetirementEvidence,
   observeRetirementFailure,
   confirmCompletedUpdates,
   markInterruptedJobs
 } from './agent-state.mjs';
+import { recordOperationLog, readOperationLogTail } from './operation-log.mjs';
+import { execSync as defaultExecSync } from 'node:child_process';
 
 import {
   PONG_TIMEOUT_MS,
@@ -240,7 +246,7 @@ try {
   ensureDaemonPath();
 } catch {}
 
-const VERSION = '0.17.33';
+const VERSION = '0.17.42';
 const layout = ncLayout();
 const serverUrl = (process.env.NC_SERVER_URL || 'https://mcp.nodecommand.app').replace(/\/$/, '');
 if (process.env.NODE_ENV !== 'development') {
@@ -284,6 +290,7 @@ const cfg = {
 const LOG_SOURCES = /** @type {Record<string, string>} */ (
   Object.freeze({
     client: cfg.clientLog,
+    operations: cfg.clientLog,
     'mcp-server': cfg.serverLogFile,
     'mcp-tunnel': cfg.tunnelLogFile
   })
@@ -295,7 +302,7 @@ const LOG_SOURCES = /** @type {Record<string, string>} */ (
  * @property {number} revision
  * @property {string} digest
  * @property {Record<string, boolean>} capabilities
- * @property {{allowed_read_roots?: Array<string>, allowed_write_roots?: Array<string>}} [roots]
+ * @property {{allowed_read_roots?: Array<string>, allowed_write_roots?: Array<string>, allow_all_filesystem?: boolean}} [roots]
  * @typedef {Object} AgentStateJob
  * @property {string} [status]
  * @property {string} [claimed_at]
@@ -344,6 +351,43 @@ let lastGuiBrokerPresence = null;
 /** @type {number} */
 let telemetryCycleCount = 0;
 let retired = false;
+
+// Normal runtime work must drain before singleton ownership leaves this
+// process. The old release then remains only an update supervisor.
+let quiescing = false;
+const agentActivities = new Set();
+function beginAgentActivity() {
+  let finish = () => {};
+  const activity = new Promise((resolve) => { finish = () => resolve(undefined); });
+  agentActivities.add(activity);
+  return () => { agentActivities.delete(activity); finish(); };
+}
+async function runAgentActivity(work) {
+  if (retired || quiescing) return;
+  const finish = beginAgentActivity();
+  try { return await work(); } finally { finish(); }
+}
+async function quiesceForActivation() {
+  if (quiescing) throw activationBusyError({ blocked: true, active_sessions: -1 });
+  quiescing = true; // synchronous admission stop, before the drain can yield
+  let timer;
+  const drained = await Promise.race([
+    Promise.all([...agentActivities]).then(() => true),
+    new Promise((resolve) => { timer = setTimeout(() => resolve(false), 30000); })
+  ]);
+  clearTimeout(timer);
+  const sessions = await activationInterlock({ hasLiveSessions: countLiveSessions });
+  if (!drained || sessions.blocked) {
+    quiescing = false;
+    throw activationBusyError({ blocked: true, active_sessions: -1 });
+  }
+  const ws = liveSession;
+  liveSession = null;
+  try { ws?.close(1000, 'update handoff'); } catch {}
+  // Only pre-handoff failures may resume the old runtime. Once released,
+  // singleton ownership belongs to the candidate/recovery launcher.
+  return () => { quiescing = false; };
+}
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -415,6 +459,110 @@ async function auditPolicyFailure(job, result) {
   return wsAuditPolicyFailure(job, result, (op, p, r) => localAudit(op, p, r, cfg.localAuditFile));
 }
 
+// Agent OS identity for register + heartbeat metadata
+// (`os_info: { pretty, kernel }`). Best-effort by construction: every
+// source is guarded, the darwin shell call is bounded (<= 2s), and the
+// helpers never throw, so status reporting can never block on them.
+const OS_PRETTY_MAX_CHARS = 256;
+
+function unquoteOsReleaseValue(value) {
+  const text = String(value || '').trim();
+  if (text.length >= 2) {
+    const first = text[0];
+    const last = text[text.length - 1];
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+      return text.slice(1, -1);
+    }
+  }
+  return text;
+}
+
+/**
+ * Parse /etc/os-release content. Returns PRETTY_NAME when present,
+ * else NAME (+ VERSION_ID), else the supplied fallback (os.type()).
+ * Pure function: no filesystem or shell access.
+ */
+function parseOsRelease(text, fallback = '') {
+  try {
+    const fields = {};
+    for (const line of String(text || '').split('\n')) {
+      const match = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/.exec(line);
+      if (match) fields[match[1]] = unquoteOsReleaseValue(match[2]);
+    }
+    if (fields.PRETTY_NAME) return fields.PRETTY_NAME.slice(0, OS_PRETTY_MAX_CHARS);
+    const named = [fields.NAME, fields.VERSION_ID].filter(Boolean).join(' ').trim();
+    if (named) return named.slice(0, OS_PRETTY_MAX_CHARS);
+  } catch {
+    // fall through to fallback below
+  }
+  return String(fallback || 'unknown');
+}
+
+function safeOsType(osType) {
+  try {
+    return String(osType() || 'unknown') || 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+function safeOsRelease(osRelease) {
+  try {
+    return String(osRelease() || 'unknown') || 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+function linuxOsPretty({ osType, readFileSync }) {
+  try {
+    return parseOsRelease(readFileSync('/etc/os-release', 'utf8'), safeOsType(osType));
+  } catch {
+    return safeOsType(osType);
+  }
+}
+
+function darwinOsPretty({ osType, osRelease, execSyncFn }) {
+  try {
+    const version = String(execSyncFn('sw_vers -productVersion', { timeout: 2000 })).trim();
+    if (version) return `macOS ${version}`.slice(0, OS_PRETTY_MAX_CHARS);
+  } catch {
+    // fall through to type + release fallback
+  }
+  return `${safeOsType(osType)} ${safeOsRelease(osRelease)}`;
+}
+
+/**
+ * Best-effort OS identity for agent metadata. kernel is os.release()
+ * on all platforms. Never throws. Dependency-injectable for tests;
+ * production call sites use `collectOsInfo()` with no arguments.
+ */
+function collectOsInfo({
+  platform = process.platform,
+  osType = os.type,
+  osRelease = os.release,
+  readFileSync = fsSync.readFileSync,
+  execSyncFn = defaultExecSync
+} = {}) {
+  try {
+    const kernel = safeOsRelease(osRelease);
+    let pretty;
+    if (platform === 'linux') {
+      pretty = linuxOsPretty({ osType, readFileSync });
+    } else if (platform === 'darwin') {
+      pretty = darwinOsPretty({ osType, osRelease, execSyncFn });
+    } else if (platform === 'win32') {
+      pretty = `Windows ${kernel}`;
+    } else {
+      pretty = `${safeOsType(osType)} ${kernel}`;
+    }
+    if (!pretty) pretty = 'unknown';
+    return { pretty: String(pretty).slice(0, OS_PRETTY_MAX_CHARS), kernel };
+  } catch {
+    return { pretty: 'unknown', kernel: 'unknown' };
+  }
+}
+
 function systemPayload() {
   return {
     id: cfg.clientId,
@@ -431,12 +579,15 @@ function systemPayload() {
       cpus: os.cpus()?.length || null,
       total_memory_bytes: os.totalmem(),
       remote_exec_enabled: cfg.remoteExecEnabled,
+      os_info: collectOsInfo(),
       log_sources: Object.keys(LOG_SOURCES),
       log_delivery: 'on_demand',
       update_policy: updaterPolicy(layout),
       filesystem_layout: filesystemLayoutMetadata(layout),
       install_mode: agentInstallMode(),
       user_folders: discoverUserFolders(),
+      home_dir: installDirFacts().home_dir,
+      temp_dir: installDirFacts().temp_dir,
       transport: liveSession ? 'websocket' : 'http-poll',
       protocol_version: cfg.protocolVersion,
       capabilities: advertisedCapabilities(),
@@ -477,6 +628,7 @@ async function heartbeat() {
       metadata: {
         cpus: os.cpus()?.length || null,
         total_memory_bytes,
+        os_info: collectOsInfo(),
         uptime_seconds,
         loadavg,
         free_memory_bytes,
@@ -489,6 +641,8 @@ async function heartbeat() {
         filesystem_layout: filesystemLayoutMetadata(layout),
         install_mode: agentInstallMode(),
         user_folders: discoverUserFolders(),
+        home_dir: installDirFacts().home_dir,
+        temp_dir: installDirFacts().temp_dir,
         helper_upgrade: readHelperUpgradeState()
       }
     },
@@ -648,6 +802,18 @@ async function executeLogReadJob(job) {
       error: readErr?.code === 'ENOENT' ? 'LOG_SOURCE_NOT_FOUND' : String(readErr?.message || error)
     };
   }
+}
+
+async function executeOperationLogReadJob(job) {
+  const payload = normalizedJobPayload(job);
+  const limit = Math.max(1, Math.min(500, Number(payload.limit || 100)));
+  const entries = await readOperationLogTail(process.env.NC_CLIENT_LOG || cfg.clientLog, limit);
+  return {
+    status: 'completed',
+    entries,
+    count: entries.length,
+    duration_ms: 0
+  };
 }
 
 /**
@@ -1061,6 +1227,7 @@ async function refreshJournalHealth() {
 }
 
 function announceCapabilities() {
+  if (quiescing) return { sent: false, reason: 'update-handoff' };
   try {
     const peer = /** @type {{sendJson?: unknown}} */ (liveSession);
     if (!peer || typeof peer.sendJson !== 'function')
@@ -1087,6 +1254,7 @@ function liveCapsKey() {
 }
 
 async function refreshBrowserHealth() {
+  const wasAvailable = browserHealthCache.available;
   try {
     const h = await browserHealth();
     browserHealthCache.checked = true;
@@ -1100,6 +1268,19 @@ async function refreshBrowserHealth() {
     browserHealthCache.error = 'BROWSER_NOT_AVAILABLE';
     browserHealthCache.playwright = null;
     browserHealthCache.revision = null;
+  }
+  if (wasAvailable && !browserHealthCache.available && browserHealthCache.error === 'BROWSER_INSTALLATION_MISSING') {
+    try {
+      scheduleConvergenceRetry({
+        base: resolveBrowserRuntime({ root: layout.root }).base,
+        runAttempt: work => runAgentActivity(work),
+        onResult: async result => {
+          if (!result || typeof result !== 'object' || !('installed' in result) || result.installed !== true || browserHealthCache.available) return;
+          await refreshBrowserHealth();
+          if (browserHealthCache.available) announceCapabilities();
+        }
+      });
+    } catch {}
   }
   return { ...browserHealthCache };
 }
@@ -1116,37 +1297,8 @@ function privilegedHelperAvailable() {
     };
     if (process.platform === 'linux') return linuxPrivilegedHelperReadiness(base).ok === true;
     if (process.platform === 'darwin') return darwinPrivilegedHelperReadiness(base).ok === true;
-    if (process.platform === 'win32') return windowsPrivilegedHelperReadinessSync(base);
+    if (process.platform === 'win32') return WINDOWS_PRIVILEGED_HELPER_AVAILABLE;
     return false;
-  } catch {
-    return false;
-  }
-}
-
-let windowsHelperVerdict = { at: 0, ok: false };
-function windowsPrivilegedHelperReadinessSync(base) {
-  try {
-    if (Date.now() - windowsHelperVerdict.at < 30000) return windowsHelperVerdict.ok;
-    windowsHelperVerdict.at = Date.now();
-    Promise.resolve()
-      .then(() =>
-        windowsPrivilegedHelperReadiness({
-          ...base,
-          pipePath: '\\\\.\\pipe\\NCPrivilegedV1',
-          secretFile: path.join(String(layout?.config || ''), 'transport-secret.bin'),
-          configFile: path.join(String(layout?.config || ''), 'privileged-helper.json')
-        })
-      )
-      .then(
-        (r) => {
-          windowsHelperVerdict = { at: Date.now(), ok: r?.ok === true };
-        },
-        () => {
-          windowsHelperVerdict = { at: Date.now(), ok: false };
-        }
-      )
-      .catch(() => {});
-    return windowsHelperVerdict.ok;
   } catch {
     return false;
   }
@@ -1165,15 +1317,33 @@ async function windowsTransportProof(request) {
   }
 }
 
+// L01b-4: same file-secret feeds reply-frame HMAC verification (the daemon
+// seals every reply with it). Resolved per call so rotations apply live.
+async function windowsReplySecret() {
+  try {
+    return await loadTransportSecret(
+      path.join(String(layout?.config || ''), 'transport-secret.bin')
+    );
+  } catch {
+    return null;
+  }
+}
+
 function getHandlers() {
   if (handlerRegistry) return handlerRegistry;
-  const options = { readRoots: cfg.readRoots },
+  const options = {
+      readRoots: cfg.readRoots,
+      invokePrivilegedHelper,
+      isPrivilegedHelperAvailable: privilegedHelperAvailable
+    },
     base = makeStructuredHandlers(options),
     mutations = makeMutationHandlers({
       writeRoots: [layout.root],
       policyGate: mutationPolicyGate,
       appRoot: layout.root,
-      workspace: layout.workspace
+      workspace: layout.workspace,
+      invokePrivilegedHelper,
+      isPrivilegedHelperAvailable: privilegedHelperAvailable
     }),
     processes = makeProcessHandlers({ stateDir: layout.data }),
     services = makeServiceHandlers(process.platform, {
@@ -1221,6 +1391,7 @@ function getHandlers() {
       }),
       shell_exec: executeShellJob,
       log_read: executeLogReadJob,
+      operation_log_read: executeOperationLogReadJob,
       privilege_status: executePrivilegeStatusJob,
       browser_navigate: browserNavigateJob,
       browser_interact: browserInteractJob,
@@ -1247,7 +1418,8 @@ function getHandlers() {
         ? {
             privileged_shell_exec: makePrivilegedHelperClientHandler({
               isAvailable: privilegedHelperAvailable,
-              transportProof: windowsTransportProof
+              transportProof: windowsTransportProof,
+              replySecret: windowsReplySecret
             })
           }
         : {}),
@@ -1288,7 +1460,8 @@ function getHandlers() {
         ? {
             file_permissions: makeFilePermissionsClientHandler({
               isAvailable: privilegedHelperAvailable,
-              transportProof: windowsTransportProof
+              transportProof: windowsTransportProof,
+              replySecret: windowsReplySecret
             })
           }
         : {}),
@@ -1347,16 +1520,52 @@ async function executeByTool(job) {
       error: 'UNSUPPORTED_TOOL:' + String(job.tool || ''),
       result_payload: {}
     };
-  const started = Date.now(),
+  const started = Date.now();
+  let r;
+  try {
+    const policyRoots = currentPolicy?.roots || {};
+    const dispatchRoots = job.agent_policy_roots || {};
+    const roots = { ...policyRoots };
+    for (const key of ['allowed_read_roots', 'allowed_write_roots']) {
+      roots[key] = [...new Set([
+        ...(Array.isArray(policyRoots[key]) ? policyRoots[key] : []),
+        ...(Array.isArray(dispatchRoots[key]) ? dispatchRoots[key] : [])
+      ].filter(value => typeof value === 'string'))];
+    }
+    roots.allow_all_filesystem = policyRoots.allow_all_filesystem === true || dispatchRoots.allow_all_filesystem === true;
     r = await h({
       ...job,
       agent_policy_capabilities: currentPolicy?.capabilities || null,
-      agent_policy_roots: currentPolicy?.roots || null
+      agent_policy_roots: roots
     });
+  } catch (err) {
+    const errorCode =
+      (err && typeof err === 'object' && err.code != null && String(err.code).trim()) ||
+      (err && typeof err === 'object' && err.message != null && String(err.message).trim()) ||
+      (typeof err === 'string' && err.trim()) ||
+      'INTERNAL_ERROR';
+    r = {
+      status: 'failed',
+      exit_code: null,
+      stdout: '',
+      stderr: '',
+      duration_ms: Date.now() - started,
+      error: errorCode,
+      result_payload: {}
+    };
+  }
   if (r.duration_ms == null) r.duration_ms = Date.now() - started;
   const op = String(job.tool || ''),
     payload = normalizedJobPayload(job);
   await localAudit(op, localAuditPayload(op, payload, r), r, cfg.localAuditFile);
+  // Observer-effect guard: reading the operation log is not an operation.
+  // Recording operation_log_read would append a new line on every dashboard
+  // poll (~15s per host) into the very file being read.
+  if (String(job.tool || '') !== 'operation_log_read') {
+    try {
+      await recordOperationLog(process.env.NC_CLIENT_LOG || cfg.clientLog, job, r);
+    } catch {}
+  }
   return r;
 }
 
@@ -1375,7 +1584,7 @@ async function authorizePreparedUpdate(record) {
  * slot: a newer deferral replaces an older one, success or a terminal error
  * clears it). The staged tree is untouched by a refusal, so retrying later
  * when sessions drain is always safe (forward-only, idempotent).
- * @type {{result: Record<string, unknown>, job_id: string, version: string|null, transport: string}|null}
+ * @type {{result: Record<string, unknown>, job_id: string, version: unknown, transport: string}|null}
  */
 let deferredActivation = null;
 /** Live-session probe for the OTA interlock (process-sessions table). */
@@ -1410,37 +1619,45 @@ export async function maybeRetryDeferredActivation(state, transport) {
       return;
     }
   }
-  try {
-    const act = await activatePreparedUpdate(pending.result, {
-      layout,
-      clientId: cfg.clientId,
-      serviceUid: typeof process.getuid === 'function' ? process.getuid() : 0,
-      serviceGid: typeof process.getgid === 'function' ? process.getgid() : 0,
-      hasLiveSessions: activationSessionProbe
-    });
-    deferredActivation = null;
+  deferredActivation = null;
+  schedulePreparedActivation(pending.result, pending.job_id, transport);
+}
+
+function schedulePreparedActivation(result, jobId, transport) {
+  // Do not await supervision inside a tracked ACK/job/telemetry activity:
+  // the quiesce barrier must be able to drain that activity first.
+  activatePreparedUpdate(result, {
+    layout,
+    jobId,
+    clientId: cfg.clientId,
+    serviceUid: typeof process.getuid === 'function' ? process.getuid() : 0,
+    serviceGid: typeof process.getgid === 'function' ? process.getgid() : 0,
+    hasLiveSessions: activationSessionProbe,
+    quiesce: quiesceForActivation
+  }).then(async (act) => {
     await log(act?.rolled_back ? 'error' : 'info', 'client_update_activated', {
-      job_id: pending.job_id,
-      version: pending.version,
-      rolled_back: Boolean(act?.rolled_back),
-      transport,
-      deferred: true
+      job_id: jobId, version: resultPayloadOf(result)?.version,
+      rolled_back: Boolean(act?.rolled_back), transport
     });
-  } catch (error) {
-    if (isActivationBusyError(error)) return;
-    deferredActivation = null;
+  }).catch(async (error) => {
+    if (isActivationBusyError(error)) {
+      deferredActivation = {
+        result, job_id: jobId, version: resultPayloadOf(result)?.version, transport
+      };
+      await log('warning', 'client_update_activation_deferred', {
+        job_id: jobId, error: error.message, suggested_action: 'wait', transport
+      });
+      return;
+    }
     await log('error', 'client_update_activation_failed', {
-      job_id: pending.job_id,
-      version: pending.version,
-      error: /** @type {Record<string, unknown>} */ (error).message,
-      transport,
-      deferred: true
+      job_id: jobId, version: resultPayloadOf(result)?.version, error: error.message, transport
     });
-  }
+  }).catch(() => {});
 }
 
 async function flushPendingResults(state) {
   for (const [jobId, rawResult] of Object.entries(state.pendingResults)) {
+    if (state.jobs[jobId]?.cancelRequested) continue;
     const result = /** @type {Record<string, unknown>} */ (rawResult);
     try {
       await postJobResult(jobId, result, cfg);
@@ -1451,6 +1668,7 @@ async function flushPendingResults(state) {
         result_sent_at: new Date().toISOString()
       };
       await writeState(state, cfg.stateFile);
+      await removePendingResult(jobId, { stateFile: cfg.stateFile });
       await log('info', 'job_result_sent', { job_id: jobId, status: result.status });
       if (
         state.jobs[jobId]?.tool === 'client_update' &&
@@ -1472,50 +1690,7 @@ async function flushPendingResults(state) {
           version: resultPayloadOf(result)?.version,
           transport: 'http-poll'
         });
-        try {
-          const act = await activatePreparedUpdate(result, {
-            layout,
-            clientId: cfg.clientId,
-            serviceUid: typeof process.getuid === 'function' ? process.getuid() : 0,
-            serviceGid: typeof process.getgid === 'function' ? process.getgid() : 0,
-            hasLiveSessions: activationSessionProbe
-          });
-          await log(act?.rolled_back ? 'error' : 'info', 'client_update_activated', {
-            job_id: jobId,
-            version: resultPayloadOf(result)?.version,
-            rolled_back: Boolean(act?.rolled_back),
-            transport: 'http-poll'
-          });
-        } catch (error) {
-          if (isActivationBusyError(error)) {
-            // Interlock refusal: sessions are live. Keep the staged tree and
-            // retry later (forward-only, idempotent) instead of failing.
-            deferredActivation = {
-              result,
-              job_id: jobId,
-              version:
-                typeof resultPayloadOf(result)?.version === 'string'
-                  ? /** @type {string} */ (resultPayloadOf(result)?.version)
-                  : null,
-              transport: 'http-poll'
-            };
-            await log('warning', 'client_update_activation_deferred', {
-              job_id: jobId,
-              version: resultPayloadOf(result)?.version,
-              error: /** @type {Record<string, unknown>} */ (error).message,
-              suggested_action: 'wait',
-              transport: 'http-poll'
-            });
-            continue;
-          }
-          await log('error', 'client_update_activation_failed', {
-            job_id: jobId,
-            version: resultPayloadOf(result)?.version,
-            error: /** @type {Record<string, unknown>} */ (error).message,
-            transport: 'http-poll'
-          });
-          throw error;
-        }
+        schedulePreparedActivation(result, jobId, 'http-poll');
       }
     } catch (error) {
       await log('error', 'job_result_retry_failed', {
@@ -1535,9 +1710,11 @@ async function flushPendingResults(state) {
 }
 
 async function processOneJob(state) {
+  if (retired) return { claimed: false, retired: true };
   if (!cfg.remoteExecEnabled) return { claimed: false, disabled: true };
   if (!cfg.clientToken) throw new Error('REMOTE_EXEC_REQUIRES_CLIENT_TOKEN');
   if (!(await flushPendingResults(state))) return { claimed: false, pending_result: true };
+  if (retired) return { claimed: false, retired: true };
 
   const claimResponse = await postJson(
     `/api/clients/${encodeURIComponent(cfg.clientId)}/jobs/claim`,
@@ -1546,6 +1723,7 @@ async function processOneJob(state) {
     cfg
   );
   const job = extractJob(claimResponse);
+  if (retired) return { claimed: false, retired: true };
   if (!job) return { claimed: false };
   const jobId = normalizedJobId(job);
   // P23 prototype-key guard: a `__proto__` claim id would confuse the plain-
@@ -1581,15 +1759,25 @@ async function processOneJob(state) {
   await writeState(state, cfg.stateFile);
 
   const policyCheck = await ensureJobPolicy(job);
+  if (retired || state.jobs[jobId]?.cancelRequested) return { claimed: true, job_id: jobId, cancelled: true };
   await postJobStart(jobId, cfg);
   state.jobs[jobId].status = 'running';
   state.jobs[jobId].started_at = new Date().toISOString();
   await writeState(state, cfg.stateFile);
 
+  if (retired || state.jobs[jobId]?.cancelRequested) return { claimed: true, job_id: jobId, cancelled: true };
+
   let result;
   if (!policyCheck.ok) {
     result = policyFailureResult(policyCheck);
     await auditPolicyFailure(job, result);
+    // Observer-effect guard: reading the operation log is not an operation
+    // (see executeByTool) — never record operation_log_read, even on denial.
+    if (String(job.tool || '') !== 'operation_log_read') {
+      try {
+        await recordOperationLog(process.env.NC_CLIENT_LOG || cfg.clientLog, job, result);
+      } catch {}
+    }
   } else {
     result = await executeByTool(job);
   }
@@ -1651,6 +1839,7 @@ async function ackSessionResult(state, jobId, status) {
     result_sent_at: new Date().toISOString()
   };
   await writeState(state, cfg.stateFile);
+  await removePendingResult(jobId, { stateFile: cfg.stateFile });
   await log('info', 'session_result_ack', { job_id: jobId, status });
   if (
     record.tool === 'client_update' &&
@@ -1671,45 +1860,7 @@ async function ackSessionResult(state, jobId, status) {
       job_id: jobId,
       version: resultPayloadOf(result)?.version
     });
-    try {
-      const act = await activatePreparedUpdate(result, {
-        layout,
-        clientId: cfg.clientId,
-        serviceUid: typeof process.getuid === 'function' ? process.getuid() : 0,
-        serviceGid: typeof process.getgid === 'function' ? process.getgid() : 0,
-        hasLiveSessions: activationSessionProbe
-      });
-      await log(act?.rolled_back ? 'error' : 'info', 'client_update_activated', {
-        job_id: jobId,
-        version: resultPayloadOf(result)?.version,
-        rolled_back: Boolean(act?.rolled_back)
-      });
-    } catch (error) {
-      if (isActivationBusyError(error)) {
-        deferredActivation = {
-          result,
-          job_id: jobId,
-          version:
-            typeof resultPayloadOf(result)?.version === 'string'
-              ? /** @type {string} */ (resultPayloadOf(result)?.version)
-              : null,
-          transport: 'session'
-        };
-        await log('warning', 'client_update_activation_deferred', {
-          job_id: jobId,
-          version: resultPayloadOf(result)?.version,
-          error: /** @type {Record<string, unknown>} */ (error).message,
-          suggested_action: 'wait'
-        });
-        return;
-      }
-      await log('error', 'client_update_activation_failed', {
-        job_id: jobId,
-        version: resultPayloadOf(result)?.version,
-        error: /** @type {Record<string, unknown>} */ (error).message
-      });
-      throw error;
-    }
+    schedulePreparedActivation(result, jobId, 'session');
   }
 }
 
@@ -1718,17 +1869,21 @@ async function handleSessionCancel(state, msg) {
 }
 
 async function handleSessionJob(state, ws, msg) {
-  return transportHandleSessionJob(state, ws, msg, {
+  return runAgentActivity(() => transportHandleSessionJob(state, ws, msg, {
     ensurePolicy: ensureJobPolicy,
     policyFailure: policyFailureResult,
     auditPolicyFail: auditPolicyFailure,
     executeTool: executeByTool,
+    canExecute: () => !retired,
     log,
     stateFile: cfg.stateFile
-  });
+  }));
 }
 
 async function runSessionOnce(state) {
+  if (retired || quiescing) return;
+  const finishStartup = beginAgentActivity();
+  try {
   const privateKey = await getDeviceKey(cfg.deviceKeyFile),
     sessionUrl = cfg.serverUrl + '/agent/connect',
     proof = createDeviceProof({
@@ -1741,16 +1896,24 @@ async function runSessionOnce(state) {
     ws = /** @type {AgentSessionSocket} */ (
       await connectWebSocket(cfg.serverUrl, { token: cfg.clientToken, deviceProof: proof })
     );
+  if (retired || quiescing) {
+    ws.close(1000, 'client retired');
+    return;
+  }
   let welcomed = false;
   /** @type {(value?: unknown) => void} */
   let resolveWelcome;
   /** @type {(reason?: unknown) => void} */
   let rejectWelcome;
   const welcome = new Promise((r, j) => {
-      resolveWelcome = r;
-      rejectWelcome = j;
-    }),
-    timer = setTimeout(() => rejectWelcome(new Error('WELCOME_TIMEOUT')), 10000);
+    resolveWelcome = r;
+    rejectWelcome = j;
+  });
+  // T-C4: the watchdog is ARMED below, after the startup probes — arming
+  // it here starts the 10s clock before 8 bounded probes run, so slow
+  // probes abort every session and misreport as a server fault.
+  /** @type {ReturnType<typeof setTimeout>|undefined} */
+  let timer;
 
   const watchdog = attachPongWatchdog({
     onTimeout: () => {
@@ -1762,6 +1925,8 @@ async function runSessionOnce(state) {
     }
   });
   ws.on('json', (m) => {
+    if (retired) return;
+    if (quiescing && m.type !== 'welcome') return;
     watchdog.poke();
     if (m.type === 'welcome') {
       welcomed = true;
@@ -1786,7 +1951,7 @@ async function runSessionOnce(state) {
     if (m.type === 'cancel') {
       // Same unhandled-rejection guard as request/ack: cancel persists
       // state via writeState and must never kill the agent on failure.
-      handleSessionCancel(state, m).catch((e) => {
+      runAgentActivity(() => handleSessionCancel(state, m)).catch((e) => {
         log('error', 'session_cancel_async_failed', {
           job_id: String(m?.data?.job_id || m?.id || ''),
           error: e instanceof Error ? e.message : String(e)
@@ -1797,7 +1962,7 @@ async function runSessionOnce(state) {
     if (m.type === 'event' && m.kind === 'result_ack') {
       // Same unhandled-rejection guard: ack persists state and may
       // activate updates (which rethrows after logging).
-      ackSessionResult(state, String(m.data?.job_id || ''), m.data?.status).catch((e) => {
+      runAgentActivity(() => ackSessionResult(state, String(m.data?.job_id || ''), m.data?.status)).catch((e) => {
         log('error', 'session_ack_async_failed', {
           job_id: String(m.data?.job_id || ''),
           error: e instanceof Error ? e.message : String(e)
@@ -1831,6 +1996,14 @@ async function runSessionOnce(state) {
       refreshDarwinGuiHealth()
     ]);
   } catch {}
+  if (retired || quiescing) {
+    watchdog.cancel();
+    ws.close(1000, 'client retired');
+    return;
+  }
+  // T-C4: arm the 10s welcome watchdog only now that the probes are done,
+  // immediately before the hello it guards.
+  timer = setTimeout(() => rejectWelcome(new Error('WELCOME_TIMEOUT')), 10000);
   ws.sendJson(sessionHello());
   // NB: preWelcomeError stays attached until the settle listeners below
   // are in place. Removing it here (e.g. via .finally) would reopen the
@@ -1859,6 +2032,11 @@ async function runSessionOnce(state) {
   // central-supplied identity/binding or refetches fresh, so keeping the
   // cache is availability without weakening denial.
   if (w?.policy) applyCurrentPolicy(w.policy, w.policy_sig);
+  if (retired || quiescing) {
+    watchdog.cancel();
+    ws.close(1000, 'client retired');
+    return;
+  }
   liveSession = ws;
   // Settle listeners BEFORE dropping the pre-welcome error guard: between
   // welcome and the old await below, a socket 'error' had no listener and
@@ -1904,11 +2082,13 @@ async function runSessionOnce(state) {
   try { await flushSessionPending(state, ws, cfg); } catch (e) { await log('error', 'flush_pending_failed', { error: String(e) }); }
   const hb = Math.max(5, Number(w.heartbeat_interval_seconds || 30)) * 1000,
     h = setInterval(() => {
+      if (quiescing || retired) return;
       try {
         ws.sendJson({ type: 'ping', timestamp: new Date().toISOString() });
         watchdog.sentPing();
       } catch {}
     }, hb);
+  finishStartup();
   try {
     await settled;
   } catch (error) {
@@ -1928,15 +2108,18 @@ async function runSessionOnce(state) {
     error.closeReason = closeReason;
     throw error;
   }
+  } finally { finishStartup(); }
 }
 
 async function sessionLoop(state) {
   if (!cfg.sessionEnabled || !cfg.remoteExecEnabled || !cfg.clientToken) return;
   let attempt = 0;
   while (!retired) {
+    if (quiescing) { await sleep(250); continue; }
     const wait = SESSION_BACKOFF[Math.min(attempt, SESSION_BACKOFF.length - 1)];
     if (wait) await sleep(reconnectDelayMs(wait));
     if (retired) return;
+    if (quiescing) continue;
     try {
       await runSessionOnce(state);
       attempt = 0;
@@ -1986,6 +2169,12 @@ async function runTelemetryOnce(state) {
     );
   }
   await log('info', 'telemetry_cycle_ok', { counts });
+  // L01a-8: WS-connected agents otherwise never retry a deferred OTA
+  // activation (the retry previously ran only on the HTTP-poll path).
+  // Guarded: a retry failure must never fail the telemetry cycle.
+  try {
+    await maybeRetryDeferredActivation(state, 'session');
+  } catch {}
   telemetryCycleCount++;
   try {
     if (telemetryCycleCount % 8 === 0) {
@@ -2057,12 +2246,28 @@ async function runTelemetryOnce(state) {
   return { state, counts };
 }
 
+async function retireAgent(state) {
+  retired = true;
+  const ws = liveSession;
+  liveSession = null;
+  try {
+    ws?.close(1000, 'client retired');
+  } catch {}
+  for (const [jobId, record] of Object.entries(state.jobs || {})) {
+    if (!['claimed', 'running'].includes(record?.status)) continue;
+    await transportHandleSessionCancel(state, { job_id: jobId }, { log, stateFile: cfg.stateFile });
+  }
+}
+
 async function telemetryLoop(state) {
   while (!retired) {
+    if (quiescing) { await sleep(250); continue; }
+    let delay = cfg.heartbeatSeconds;
+    await runAgentActivity(async () => {
     try {
       await runTelemetryOnce(state);
-      if (!retired) await sleep(cfg.heartbeatSeconds * 1000);
     } catch (error) {
+      delay = cfg.retrySeconds;
       if (/** @type {Record<string, unknown>} */ (error)?.status === 404) {
         state.registered = false;
         state.registered_client_id = null;
@@ -2075,20 +2280,24 @@ async function telemetryLoop(state) {
           retiredMarker: layout.retiredMarker,
           logFn: log
         })
-      )
+      ) {
+        await retireAgent(state);
         return;
+      }
       await log('error', 'telemetry_cycle_failed', {
         error: /** @type {Record<string, unknown>} */ (error)?.message || String(error)
       });
-      if (!retired) await sleep(cfg.retrySeconds * 1000);
     }
+    });
+    if (!retired) await sleep(delay * 1000);
   }
 }
 
 async function jobLoop(state) {
   while (!retired) {
+    if (quiescing) { await sleep(250); continue; }
     try {
-      if (!liveSession) await processOneJob(state);
+      if (!liveSession) await runAgentActivity(() => processOneJob(state));
       if (!retired) await sleep(cfg.jobPollSeconds * 1000);
     } catch (error) {
       await log('error', 'job_cycle_failed', {
@@ -2097,6 +2306,76 @@ async function jobLoop(state) {
       if (!retired) await sleep(cfg.retrySeconds * 1000);
     }
   }
+}
+
+// Every convergence attempt (including delayed retries) uses normal admission.
+// An admitted installer must finish before handoff; old timers cannot mutate
+// the shared runtime tree once this process is quiescing or retired.
+async function convergeBrowserRuntime(rtBase, m, { attempt = 0, validateFails = 0 } = {}) {
+  return runAgentActivity(async () => {
+    for (let bootAttempt = 1; bootAttempt <= (attempt ? 1 : 4); bootAttempt++) {
+      if (retired || quiescing) return;
+      try {
+        if (attempt && await fs.access(path.join(rtBase, 'playwright-browsers.staging')).then(() => true, () => false)) return;
+        let coreFailure = null;
+        try {
+          const core = await m.ensurePlaywrightCore(rtBase);
+          await log('info', 'browser_core_convergence', { ...core });
+          if (attempt && core?.ok !== true) coreFailure = {
+            error: String(core?.error || 'BROWSER_CORE_PACK_FAILED').slice(0, 300),
+            stage: String(core?.stage || 'unknown'),
+            detail: typeof core?.detail === 'string' ? core.detail.slice(0, 300) : undefined
+          };
+        } catch (error) {
+          if (attempt) coreFailure = {
+            error: (error instanceof Error ? error.message : String(error)).slice(0, 300), stage: 'unknown'
+          };
+        }
+        if (coreFailure) await log('error', 'browser_runtime_install_failed', coreFailure);
+        const managed = await m.ensureManagedBrowsers(rtBase);
+        const r = coreFailure && managed?.installed !== true
+          ? { ...managed, error: coreFailure.error, stage: coreFailure.stage, runtime_install: coreFailure, note: 'BROWSER_RUNTIME_INSTALL_FAILED' }
+          : managed;
+        await log('info', attempt ? 'browser_binary_convergence_retry' : 'browser_binary_convergence', { ...r });
+        if (r.installed && !browserHealthCache.available) {
+          let refreshError = null;
+          try {
+            if (attempt) await Promise.all([
+              refreshBrowserHealth(), refreshContainerHealth(), refreshComposeHealth(), refreshJournalHealth()
+            ]);
+            else await refreshBrowserHealth();
+          } catch (e) {
+            refreshError = e instanceof Error ? e.message.slice(0, 160) : String(e).slice(0, 160);
+          }
+          const announced = !attempt || browserHealthCache.available ? announceCapabilities() : { sent: false };
+          await log('info', 'browser_convergence_announced', {
+            available: browserHealthCache.available, refresh_error: refreshError, ...announced
+          });
+        }
+        if (!r.installed && !retired && !quiescing) {
+          const outcome = attempt
+            ? m.convergenceValidateOutcome({ stage: r.stage, validateFails })
+            : { terminal: false, fails: 0 };
+          if (outcome.terminal) {
+            await log('info', 'browser_binary_convergence_retry', { ...r, terminal: true, note: outcome.note });
+            return;
+          }
+          const timer = setTimeout(() => {
+            void convergeBrowserRuntime(rtBase, m, { attempt: attempt + 1, validateFails: outcome.fails });
+          }, m.convergenceRetryDelay(attempt + 1));
+          timer.unref?.();
+        }
+        return;
+      } catch (error) {
+        await log('warn', 'browser_convergence_boot_retry', {
+          attempt: bootAttempt,
+          error: error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200)
+        });
+      }
+      if (retired || quiescing || attempt) return;
+      await sleep(Math.min(60000, 5000 * bootAttempt));
+    }
+  });
 }
 
 async function main() {
@@ -2137,8 +2416,9 @@ async function main() {
     }
   } catch {}
   try {
+    const browserRuntime = await import('../browser/browser-runtime.mjs');
     const { activateStagedBrowserRuntime, activateBundledBrowserRuntime, resolveBrowserRuntime } =
-      await import('../browser/browser-runtime.mjs');
+      browserRuntime;
     const rtBase = resolveBrowserRuntime({ root: layout.root }).base;
     const bundled = await activateBundledBrowserRuntime({
       appDir: mainScriptDir(),
@@ -2146,65 +2426,7 @@ async function main() {
     });
     const promoted = await activateStagedBrowserRuntime(rtBase);
     await log('info', 'browser_runtime_promotion', { bundled, staged: promoted });
-    (async () => {
-      for (let attempt = 1; attempt <= 4; attempt++) {
-        try {
-          const m = await import('../browser/browser-runtime.mjs');
-          try {
-            const core = await m.ensurePlaywrightCore(rtBase);
-            await log('info', 'browser_core_convergence', { ...core });
-          } catch {}
-          const r = /** @type {{installed?: unknown}} */ (await m.ensureManagedBrowsers(rtBase));
-          await log('info', 'browser_binary_convergence', { ...r });
-          if (r.installed && !browserHealthCache.available) {
-            let refreshError = null;
-            try {
-              await refreshBrowserHealth();
-            } catch (e) {
-              refreshError = e instanceof Error ? e.message.slice(0, 160) : String(e).slice(0, 160);
-            }
-            const announced = announceCapabilities();
-            await log('info', 'browser_convergence_announced', {
-              available: browserHealthCache.available,
-              refresh_error: refreshError,
-              ...announced
-            });
-          }
-          if (!r.installed) {
-            try {
-              m.scheduleConvergenceRetry({
-                base: rtBase,
-                onResult: async (rr) => {
-                  const rec = /** @type {{installed?: unknown}} */ (
-                    typeof rr === 'object' && rr !== null ? rr : {}
-                  );
-                  await log('info', 'browser_binary_convergence_retry', { ...rec });
-                  if (rec.installed && !browserHealthCache.available) {
-                    try {
-                      await Promise.all([
-                        refreshBrowserHealth(),
-                        refreshContainerHealth(),
-                        refreshComposeHealth(),
-                        refreshJournalHealth()
-                      ]);
-                    } catch {}
-                    if (browserHealthCache.available) announceCapabilities();
-                  }
-                }
-              });
-            } catch {}
-          }
-          return;
-        } catch (error) {
-          await log('warn', 'browser_convergence_boot_retry', {
-            attempt,
-            error:
-              error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200)
-          });
-        }
-        await sleep(Math.min(60000, 5000 * attempt));
-      }
-    })();
+    void convergeBrowserRuntime(rtBase, browserRuntime);
   } catch {}
   try {
     await refreshBrowserHealth();
@@ -2267,6 +2489,7 @@ export {
   attachPongWatchdog,
   boundSessionResult,
   browserHealthCache,
+  collectOsInfo,
   containerHealthCache,
   composeHealthCache,
   journalHealthCache,
@@ -2286,7 +2509,10 @@ export {
   defaultShellCwd,
   detectLegacyArtifacts,
   discoverUserFolders,
+  installDirFacts,
+  executeByTool,
   executeLogReadJob,
+  executeOperationLogReadJob,
   executePrivilegeStatusJob,
   executeShellJob,
   getHandlers,
@@ -2295,6 +2521,7 @@ export {
   localAuditPayload,
   main,
   nextSessionAttempt,
+  parseOsRelease,
   processOneJob,
   reconnectDelayMs,
   refreshBrowserHealth,

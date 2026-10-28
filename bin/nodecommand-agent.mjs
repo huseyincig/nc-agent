@@ -25,7 +25,7 @@ Environment variables (passthrough to platform installer):
   NC_ROOT            Target installation directory
                      Linux:   default /opt/nc (system) or ~/.local/share/nc (user)
                      macOS:   default /opt/nc (system) or ~/Library/Application Support/nc (user)
-                     Windows: default C:\\NC
+                     Windows: default %ProgramData%\\NC (normally C:\\ProgramData\\NC)
   NC_USER_INSTALL    Set to 1 to force non-elevated user-level installation
   NC_SYSTEM_INSTALL  Set to 1 to require system-level service installation
   NC_SRC             Override agent source root (defaults to staged runtime tree)
@@ -124,7 +124,7 @@ async function main() {
       path.join(PKG_ROOT, 'scripts/package-release.mjs')
     ).href;
     const { stageRuntime } = await import(releaseModulePath);
-    await stageRuntime(stageDir, version, null);
+    await stageRuntime(stageDir, version, { withHelpers: false });
 
     const peercredCandidates = [
       path.join(PKG_ROOT, 'installers/linux/native/linux-peercred.c'),

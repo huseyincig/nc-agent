@@ -67,11 +67,16 @@ export function suggestedActionForHelperError(code) {
  * @param {((request: unknown) => Promise<string|null>)|null} [options.transportProof] file-secret
  * proof provider for transports without kernel peer credentials (win32);
  * resolved per call so rotations take effect without restart.
+ * @param {((request: unknown) => Promise<string|null>)|null} [options.replySecret] L01b-4:
+ * transport-secret provider for reply-frame HMAC verification (same secret
+ * as transportProof); resolved per call. Absent = no reply verification
+ * (unix-socket transports keep kernel peer credentials).
  */
 export function makePrivilegedHelperClientHandler({
   invoke = invokePrivilegedHelper,
   isAvailable,
-  transportProof = null
+  transportProof = null,
+  replySecret = null
 } = {}) {
   /**
    * @param {string} error
@@ -107,9 +112,11 @@ export function makePrivilegedHelperClientHandler({
     const started = Date.now();
     try {
       const proof = transportProof ? await transportProof(request).catch(() => null) : null;
+      const secret = typeof replySecret === "function" ? await replySecret(request).catch(() => null) : null;
       reply = /** @type {Record<string, any>} */ (
         await invoke(request, {
           ...(proof ? { transportProof: proof } : {}),
+          ...(secret ? { replySecret: secret } : {}),
           timeoutMs: timeoutMsForPrivilegedRequest(request)
         })
       );
@@ -196,11 +203,15 @@ export function makePrivilegedHelperClientHandler({
  * @param {((request: unknown) => Promise<string|null>)|null} [options.transportProof] file-secret
  * proof provider for transports without kernel peer credentials (win32);
  * resolved per call so rotations take effect without restart.
+ * @param {((request: unknown) => Promise<string|null>)|null} [options.replySecret] L01b-4:
+ * same-secret provider for reply-frame HMAC verification (see generic
+ * handler); absent = no reply verification.
  */
 export function makeFilePermissionsClientHandler({
   invoke = invokePrivilegedHelper,
   isAvailable,
-  transportProof = null
+  transportProof = null,
+  replySecret = null
 } = {}) {
   /**
    * @param {string} error
@@ -252,9 +263,11 @@ export function makeFilePermissionsClientHandler({
     let reply;
     try {
       const proof = transportProof ? await transportProof(request).catch(() => null) : null;
+      const secret = typeof replySecret === "function" ? await replySecret(request).catch(() => null) : null;
       reply = /** @type {Record<string, any>} */ (
         await invoke(request, {
           ...(proof ? { transportProof: proof } : {}),
+          ...(secret ? { replySecret: secret } : {}),
           timeoutMs: timeoutMsForPrivilegedRequest(request)
         })
       );

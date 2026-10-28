@@ -1,5 +1,5 @@
 import fs from 'node:fs/promises';
-import { constants as fsConstants } from 'node:fs';
+import { constants as fsConstants, readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -7,8 +7,9 @@ import { runtimeRoot } from '../client/nc-paths.mjs';
 import { DOC_FORMATS, MAX_TEXT_CHARS, extractDocument, readDocFile } from './doc-extract.mjs';
 import { policyExtraRoots } from '../policy/host-policy.mjs';
 import { isSensitivePath } from '../filesystem/sensitive-paths.mjs';
-import { MutationError, resolveTargetPath } from '../filesystem/path-auth.mjs';
+import { MutationError, resolveTargetPath, authorizeMutationPath, within } from '../filesystem/path-auth.mjs';
 import { spawn } from 'node:child_process';
+import { terminateSessionTreeAsync } from '../process/process-sessions.mjs';
 
 /**
  * Positional read loop: a single fh.read may return fewer bytes than asked
@@ -33,16 +34,50 @@ export async function readExact(fh, buf, length, position) {
  * Return shape matches the old readFile+subarray behavior exactly.
  * @param {string} file @param {number} max
  */
-export async function readBounded(file, max) {
+/**
+ * Open-once read guard within a positively trusted complete namespace.
+ * O_NONBLOCK prevents a FIFO from blocking until a writer appears;
+ * O_NOFOLLOW guards the leaf and fh.stat() verifies the opened type before
+ * reading a byte. The 'r' fallback retains the ancestry and handle checks.
+ * @param {string} file
+ * @param {typeof import('node:fs/promises')} [fsApi]
+ */
+export async function openRegularForRead(file, fsApi = fs) {
+  // O_NOFOLLOW only guards the leaf. Without a native handle-relative resolver,
+  // refuse any namespace another user can replace, all the way to its root.
+  await authorizeMutationPath(file, { allowAll: true, fsApi });
+  let fh = null;
+  try {
+    fh = await fsApi.open(
+      file,
+      fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK || 0) | (fsConstants.O_NOFOLLOW || 0)
+    );
+  } catch (openError) {
+    const code = /** @type {NodeJS.ErrnoException} */ (openError)?.code;
+    if (code === 'ELOOP' || code === 'EMLINK') throw new Error('PATH_TYPE_NOT_SUPPORTED', { cause: openError });
+    if (code === 'EINVAL' || code === 'ENOSYS' || code === 'EOPNOTSUPP')
+      fh = await fsApi.open(file, 'r');
+    else throw openError;
+  }
+  try {
+    const st = await fh.stat();
+    if (!st.isFile()) throw new Error('PATH_TYPE_NOT_SUPPORTED');
+    return fh;
+  } catch (e) {
+    try {
+      await fh.close();
+    } catch {}
+    throw e;
+  }
+}
+export async function readBounded(file, max, fsApi = fs) {
   const limit = Math.max(1, Math.min(65536, Number(max) || 65536));
   // P28-S2: pre-open regular-file guard. Opening a FIFO for reading blocks
   // until a writer appears and this path has no timeout, so a planted FIFO
   // inside the workspace would hang the job. Reject non-regular files
   // (FIFO/socket/device/directory) before open. Callers pass realpath-
-  // resolved paths; stat follows a final-component swap to the same verdict.
-  const pre = await fs.stat(file);
-  if (!pre.isFile()) throw new Error('PATH_TYPE_NOT_SUPPORTED');
-  const fh = await fs.open(file, 'r');
+  // L01b-9: open once, verify the opened handle (no pre-open stat TOCTOU).
+  const fh = await openRegularForRead(file, fsApi);
   try {
     const st = await fh.stat();
     const n = Math.min(st.size, limit);
@@ -155,12 +190,12 @@ function failFor(e, fallback = 'READ_ERROR') {
  * walk). Returns null when the direct parent exists (plain missing leaf).
  * @param {string} normalized absolute normalized target
  */
-async function ancestorForMissing(normalized) {
+async function ancestorForMissing(normalized, fsApi = fs, pathApi = path) {
   const missing = [];
   let cur = normalized;
   while (true) {
     try {
-      const realAncestor = await fs.realpath(cur);
+      const realAncestor = await fsApi.realpath(cur);
       return {
         ancestor: cur,
         realAncestor,
@@ -170,7 +205,7 @@ async function ancestorForMissing(normalized) {
       if (!e || typeof e !== 'object' || /** @type {{code?: unknown}} */ (e).code !== 'ENOENT')
         throw e;
       missing.unshift(cur);
-      const parent = path.dirname(cur);
+      const parent = pathApi.dirname(cur);
       if (parent === cur) break;
       cur = parent;
     }
@@ -184,29 +219,29 @@ async function ancestorForMissing(normalized) {
  * @param {string} target
  * @param {Array<string>} roots
  * @param {boolean} [allowAll]
- * @param {{cwd?: string|null, homedir?: string}} [options] pre-flight
+ * @param {{cwd?: string|null, homedir?: string, fsApi?: typeof fs, pathApi?: typeof path, windowsTrustReader?: (directory: string) => Promise<boolean>}} [options] pre-flight
  * normalization context (L1): `~` is always expanded; bare relative paths
  * resolve against `cwd` when supplied, otherwise keep the strict
  * PATH_NOT_ABSOLUTE gate (pinned by nc-001/phase3 suites).
  */
 export async function realAllowed(target, roots, allowAll = false, options = {}) {
-  const { cwd = null, homedir = undefined } = options || {};
+  const { cwd = null, homedir = undefined, fsApi = fs, pathApi = path, windowsTrustReader } = options || {};
   // Pre-flight normalization (L1) runs BEFORE the check, never around it.
-  const normalized = resolveTargetPath(target, { pathApi: path, cwd, homedir });
+  const normalized = resolveTargetPath(target, { pathApi, cwd, homedir });
   // Credential denylist (SEC-001): precedes allowlist AND allow_all.
-  const platform = process.platform;
+  const platform = pathApi.sep === '\\' ? 'win32' : process.platform;
   if (isSensitivePath(normalized, platform)) throw new Error('PATH_DENIED_SENSITIVE');
   /** @type {Array<string>} */
   const realRoots = [];
   for (const root of roots || []) {
     try {
-      realRoots.push(await fs.realpath(root));
+      realRoots.push(await fsApi.realpath(root));
     } catch {
       continue;
     }
   }
   /** @param {string} real */
-  const inside = (real) => realRoots.some((rr) => real === rr || real.startsWith(rr + path.sep));
+  const inside = (real) => realRoots.some((rr) => within(real, rr, pathApi));
   /** @param {string} real */
   const deny = (real) => {
     throw new MutationError('PATH_NOT_ALLOWED', {
@@ -219,14 +254,14 @@ export async function realAllowed(target, roots, allowAll = false, options = {})
   /** @type {Record<string, unknown>|null} */
   let missingInfo = null;
   try {
-    real = await fs.realpath(normalized);
+    real = await fsApi.realpath(normalized);
   } catch (e) {
     if (!e || typeof e !== 'object' || /** @type {{code?: unknown}} */ (e).code !== 'ENOENT')
       throw e;
     // Missing target: validate the deepest existing ancestor (L1 walk)
     // instead of failing on the unresolved path. Fresh throws stay outside
     // the catch block (cause-chain lint); shared checks below still apply.
-    const found = await ancestorForMissing(normalized);
+    const found = await ancestorForMissing(normalized, fsApi, pathApi);
     real = found.realAncestor;
     missingInfo = {
       path: normalized,
@@ -236,31 +271,93 @@ export async function realAllowed(target, roots, allowAll = false, options = {})
   if (isSensitivePath(real, platform)) throw new Error('PATH_DENIED_SENSITIVE');
   if (allowAll !== true && !inside(real)) deny(real);
   if (missingInfo) throw new MutationError('FILE_NOT_FOUND', missingInfo);
-  if (allowAll === true) return real;
+  await authorizeMutationPath(normalized, { roots, allowAll, fsApi, pathApi, cwd, homedir, windowsTrustReader });
   return real;
 }
 /**
+ * Spawn argv (never a shell) and capture bounded output. The timeout
+ * watchdog resolves TIMEOUT synchronously and terminates in the
+ * background (verified, like runPrivilegedCapture): awaiting termination
+ * inside the watchdog hung resolution when grandchildren held the stdio
+ * pipes, and an unresolved watchdog wedged service_status. Exported for
+ * unit tests.
  * @param {string} cmd
  * @param {Array<string>} args
  * @param {number} [timeoutMs]
  */
-async function capture(cmd, args, timeoutMs = 4000) {
+export async function capture(cmd, args, timeoutMs = 4000) {
   return new Promise((resolve) => {
+    const startedAt = new Date().toISOString();
     const p = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    // Match process-sessions' exact Linux identity, captured before yielding.
+    // Other platforms remain unverifiable without the native spawn companion.
+    let processIdentity = null;
+    if (process.platform === 'linux' && Number.isInteger(p.pid) && p.pid >= 2) {
+      try {
+        const stat = readFileSync(`/proc/${p.pid}/stat`, 'utf8');
+        const end = stat.lastIndexOf(')');
+        const ticks = stat.slice(end + 1).trim().split(/\s+/)[19];
+        const bootId = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+        if (end >= 0 && stat.startsWith(`${p.pid} (`) && /^[0-9]+$/.test(ticks || '') && /^[a-f0-9-]{36}$/i.test(bootId)) {
+          processIdentity = Object.freeze({ platform: /** @type {const} */ ('linux'), bootId, startTimeTicks: ticks });
+        }
+      } catch {
+        // Missing/malformed kernel identity must never authorize cleanup signals.
+      }
+    }
     let out = '',
       err = '';
-    const t = setTimeout(() => {
+    let settled = false;
+    // Null-stdio guard: fds can be exhausted at spawn (EMFILE-adjacent) —
+    // fail closed instead of throwing inside the executor (an executor
+    // throw becomes an unhandled rejection). The child is ours and
+    // just spawned (no PID-reuse window yet), so a direct handle kill is
+    // safe here; the verified async path below covers the timeout case.
+    if (!p.stdout || !p.stderr) {
       try {
         p.kill('SIGKILL');
       } catch {}
+      resolve({ code: null, out: '', err: '', error: 'CAPTURE_STDIO_FAILED' });
+      return;
+    }
+    const t = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      // Destroy stdio NOW so a late `close` can only no-op via the
+      // settled flag, then resolve immediately — never await termination
+      // here (pipe-holding grandchildren must not hang the watchdog).
+      try {
+        p.stdout?.destroy();
+      } catch {}
+      try {
+        p.stderr?.destroy();
+      } catch {}
+      resolve({ code: null, out, err, error: 'TIMEOUT' });
+      // Verified background termination (R-C1 identity threaded).
+      void terminateSessionTreeAsync(p, {
+        platform: process.platform,
+        force: true,
+        graceMs: 0,
+        expectedStartedAt: startedAt,
+        expectedPath: cmd,
+        expectedIdentity: processIdentity,
+        expectedCommandLine: args
+      }).catch(() => {});
     }, timeoutMs);
+    try {
+      t.unref?.();
+    } catch {}
     p.stdout.on('data', (d) => (out += d));
     p.stderr.on('data', (d) => (err += d));
     p.on('error', (e) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(t);
       resolve({ code: null, out, err, error: e.message });
     });
     p.on('close', (code) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(t);
       resolve({ code, out: out.trim(), err: err.trim() });
     });
@@ -317,14 +414,118 @@ function resolveExtras(rawTarget, resolved, readOpts) {
 }
 
 /**
+ * @param {unknown} e
+ */
+export function isAccessDeniedError(e) {
+  if (!e) return false;
+  const rec = typeof e === 'object' ? /** @type {Record<string, unknown>} */ (e) : {};
+  if (rec.code === 'EACCES' || rec.code === 'EPERM') return true;
+  const msg = String(rec.message || e);
+  return /EACCES|EPERM|permission denied|access is denied/i.test(msg);
+}
+
+/**
+ * @param {unknown} job
+ */
+function extractPrivilegedAuthorization(job) {
+  if (!job || typeof job !== 'object' || Array.isArray(job)) return null;
+  const rec = /** @type {Record<string, unknown>} */ (job);
+  for (const key of ['privileged_authorization', 'privileged_envelope']) {
+    const v = rec[key];
+    if (v && typeof v === 'object' && !Array.isArray(v)) return /** @type {Record<string, unknown>} */ (v);
+  }
+  const p = /** @type {Record<string, unknown>} */ (rec.request_payload || rec.payload || {});
+  for (const key of ['privileged_authorization', 'privileged_envelope']) {
+    const v = p[key];
+    if (v && typeof v === 'object' && !Array.isArray(v)) return /** @type {Record<string, unknown>} */ (v);
+  }
+  return null;
+}
+
+/**
+ * @param {object} options
+ * @param {string} options.path
+ * @param {unknown} [options.max_bytes]
+ * @param {unknown} options.job
+ * @param {((req: unknown) => Promise<unknown>)|null} [options.invokePrivilegedHelper]
+ * @param {(() => boolean)|null} [options.isPrivilegedHelperAvailable]
+ * @param {Array<string>} options.roots
+ * @param {boolean} options.allowAll
+ * @param {unknown} options.directError
+ * @param {typeof fs} [options.fsApi]
+ * @param {{cwd?: string|null, homedir?: string}} [options.readOpts]
+ */
+async function dispatchHelperFileRead({
+  path: targetPath,
+  max_bytes,
+  job,
+  invokePrivilegedHelper,
+  isPrivilegedHelperAvailable,
+  roots,
+  allowAll,
+  directError,
+  fsApi = fs,
+  readOpts = {}
+}) {
+  let available = typeof invokePrivilegedHelper === 'function';
+  if (available && typeof isPrivilegedHelperAvailable === 'function') {
+    try {
+      available = isPrivilegedHelperAvailable();
+    } catch {
+      available = false;
+    }
+  }
+  if (!available) throw directError;
+
+  const authorization = extractPrivilegedAuthorization(job);
+  const helperPayload = {
+    path: targetPath,
+    max_bytes: Number(max_bytes) || 65536,
+    allow_all: allowAll,
+    roots
+  };
+
+  const req = authorization
+    ? { ...authorization, payload: authorization.payload ?? helperPayload }
+    : { operation: 'file_read', payload: helperPayload };
+
+  // The helper may receive an envelope-supplied payload rather than the direct
+  // target. Both spellings must satisfy the same fail-closed ancestry policy.
+  await realAllowed(targetPath, roots, allowAll, { ...readOpts, fsApi });
+  await realAllowed(String(/** @type {Record<string, unknown>|null|undefined} */ (req.payload)?.path || ''), roots, allowAll, { ...readOpts, fsApi });
+
+  let reply;
+  try {
+    reply = await invokePrivilegedHelper(req);
+  } catch {
+    throw directError;
+  }
+  const rec = reply && typeof reply === 'object' ? /** @type {Record<string, any>} */ (reply) : null;
+  if (!rec || rec.ok !== true) throw directError;
+  const result = rec.result && typeof rec.result === 'object' ? rec.result : null;
+  if (!result || result.success !== true) throw directError;
+  return result;
+}
+
+/**
  * @param {object} [options]
  * @param {Array<string>} [options.readRoots]
  * @param {string|null} [options.cwd] pre-flight relative-resolution base
  * (null keeps the strict PATH_NOT_ABSOLUTE gate)
  * @param {string} [options.homedir] `~` expansion base (defaults to os.homedir())
+ * @param {((req: unknown) => Promise<unknown>)|null} [options.invokePrivilegedHelper]
+ * @param {(() => boolean)|null} [options.isPrivilegedHelperAvailable]
+ * @param {typeof fs} [options.fsApi]
  */
-export function makeStructuredHandlers({ readRoots = [runtimeRoot()], cwd, homedir } = {}) {
-  const readOpts = { cwd, homedir };
+export function makeStructuredHandlers({
+  readRoots = [runtimeRoot()],
+  cwd,
+  homedir,
+  invokePrivilegedHelper = null,
+  isPrivilegedHelperAvailable = null,
+  fsApi = fs
+} = {}) {
+  const readOpts = { cwd, homedir, fsApi };
   return {
     system_snapshot: async () =>
       ok({
@@ -343,13 +544,13 @@ export function makeStructuredHandlers({ readRoots = [runtimeRoot()], cwd, homed
       const p = /** @type {Record<string, unknown>} */ (
         jobRecord.request_payload || jobRecord.payload || {}
       );
+      const extraRoots = policyExtraRoots(job);
+      const roots = [...readRoots, ...extraRoots.read];
+      const allowAllRoots = extraRoots.allowAll === true;
       try {
-        const extraRoots = policyExtraRoots(job);
-        const roots = [...readRoots, ...extraRoots.read];
-        const allowAllRoots = extraRoots.allowAll === true;
         const file = await realAllowed(String(p.path || ''), roots, allowAllRoots, readOpts),
           max = Math.max(1, Math.min(65536, Number(p.max_bytes || 65536))),
-          r = await readBounded(file, max);
+          r = await readBounded(file, max, fsApi);
         return ok({
           path: file,
           content: r.content,
@@ -357,6 +558,32 @@ export function makeStructuredHandlers({ readRoots = [runtimeRoot()], cwd, homed
           truncated: r.truncated
         });
       } catch (e) {
+        if (isAccessDeniedError(e) && allowAllRoots) {
+          try {
+            const helperRes = await dispatchHelperFileRead({
+              path: String(p.path || ''),
+              max_bytes: p.max_bytes,
+              job,
+              invokePrivilegedHelper,
+              isPrivilegedHelperAvailable,
+              roots,
+              allowAll: allowAllRoots,
+              directError: e,
+              fsApi,
+              readOpts
+            });
+            if (helperRes) {
+              return ok({
+                path: helperRes.path,
+                content: helperRes.content,
+                bytes: helperRes.bytes,
+                truncated: helperRes.truncated
+              });
+            }
+          } catch {
+            // Helper failed, surface original error
+          }
+        }
         return failFor(e, 'READ_ERROR');
       }
     },
@@ -376,7 +603,7 @@ export function makeStructuredHandlers({ readRoots = [runtimeRoot()], cwd, homed
         for (const raw of rawPaths.slice(0, 10)) {
           try {
             const file = await realAllowed(String(raw || ''), roots, allowAllRoots, readOpts),
-              r = await readBounded(file, max);
+              r = await readBounded(file, max, fsApi);
             results.push({
               path: file,
               content: r.content,
@@ -385,14 +612,41 @@ export function makeStructuredHandlers({ readRoots = [runtimeRoot()], cwd, homed
               error: null
             });
           } catch (e) {
-            const errorRecord = /** @type {{message?: unknown}} */ (e);
-            results.push({
-              path: String(raw || ''),
-              content: '',
-              bytes: 0,
-              truncated: false,
-              error: String(errorRecord?.message || e)
-            });
+            let helperRes = null;
+            if (isAccessDeniedError(e) && allowAllRoots) {
+              try {
+                helperRes = await dispatchHelperFileRead({
+                  path: String(raw || ''),
+                  max_bytes: p.max_bytes,
+                  job,
+                  invokePrivilegedHelper,
+                  isPrivilegedHelperAvailable,
+                  roots,
+                  allowAll: allowAllRoots,
+                  directError: e,
+                  fsApi,
+                  readOpts
+                });
+              } catch {}
+            }
+            if (helperRes) {
+              results.push({
+                path: helperRes.path,
+                content: helperRes.content,
+                bytes: helperRes.bytes,
+                truncated: helperRes.truncated,
+                error: null
+              });
+            } else {
+              const errorRecord = /** @type {{message?: unknown}} */ (e);
+              results.push({
+                path: String(raw || ''),
+                content: '',
+                bytes: 0,
+                truncated: false,
+                error: String(errorRecord?.message || e)
+              });
+            }
           }
         }
         return ok({ results });
@@ -416,7 +670,7 @@ export function makeStructuredHandlers({ readRoots = [runtimeRoot()], cwd, homed
           1,
           Math.min(MAX_TEXT_CHARS, Math.trunc(Number(p.max_chars ?? MAX_TEXT_CHARS)) || MAX_TEXT_CHARS)
         );
-        const { bytes, buffer } = await readDocFile(file);
+        const { bytes, buffer } = await readDocFile(file, fsApi);
         const out = extractDocument(buffer, { filename: file, format: hint, maxChars });
         return ok({
           path: file,
@@ -448,16 +702,11 @@ export function makeStructuredHandlers({ readRoots = [runtimeRoot()], cwd, homed
         const length = Number(p.length ?? 49152);
         if (!Number.isInteger(length) || length < 1 || length > 49152)
           throw new Error('INVALID_LENGTH');
-        // P28-S2: pre-open regular-file guard (same FIFO-block rationale as
-        // readBounded). The post-open fh.stat() isFile check below is kept
-        // as defense-in-depth against a lstat/open swap; this pre-check is
-        // what prevents the blocking open itself.
-        const pre = await fs.stat(file);
-        if (!pre.isFile()) throw new Error('PATH_TYPE_NOT_SUPPORTED');
-        const fh = await fs.open(file, 'r');
+        // L01b-9: open once via the shared guard (O_NONBLOCK|O_NOFOLLOW +
+        // fh.stat() verify) — the old pre-open stat was a TOCTOU.
+        const fh = await openRegularForRead(file, fsApi);
         try {
           const st = await fh.stat();
-          if (!st.isFile()) throw new Error('PATH_TYPE_NOT_SUPPORTED');
           if (offset > st.size) throw new Error('TRANSFER_OFFSET_BEYOND_EOF');
           const n = Math.min(st.size - offset, length);
           const buf = Buffer.alloc(n);
@@ -692,9 +941,11 @@ export async function fileSearchJob(job, { readRoots = [runtimeRoot()], cwd, hom
         timeExceeded = true;
         break;
       }
-      const dir = /** @type {string} */ (stack.pop());
+      let dir = /** @type {string} */ (stack.pop());
       let rows = [];
       try {
+        // A permitted starting root does not authorize every descendant.
+        dir = await realAllowed(dir, roots, allowAllRoots, readOpts);
         rows = await fs.readdir(dir, { withFileTypes: true });
       } catch {
         continue;
@@ -710,16 +961,18 @@ export async function fileSearchJob(job, { readRoots = [runtimeRoot()], cwd, hom
         }
         files++;
         if (files > 2000) break;
+        let file;
         let st;
         try {
-          st = await fs.stat(full);
+          file = await realAllowed(full, roots, allowAllRoots, readOpts);
+          st = await fs.stat(file);
         } catch {
           continue;
         }
         if (st.size > 512 * 1024) continue;
         let text;
         try {
-          text = await fs.readFile(full, 'utf8');
+          text = await fs.readFile(file, 'utf8');
         } catch {
           continue;
         }
@@ -732,7 +985,7 @@ export async function fileSearchJob(job, { readRoots = [runtimeRoot()], cwd, hom
                 preview = text
                   .slice(Math.max(0, idx - 80), Math.min(text.length, idx + query.length + 120))
                   .replace(/\s+/g, ' ');
-              results.push({ path: full, line, preview });
+              results.push({ path: file, line, preview });
             } else {
               hasMore = true;
               break;

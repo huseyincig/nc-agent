@@ -40,7 +40,7 @@ export function credentialHash(credential) {
   if (typeof credential !== 'string' || !credential) throw new Error('DEVICE_CREDENTIAL_REQUIRED');
   // utf8 (not ascii): ascii silently folds code points >127, collapsing
   // distinct non-ASCII passphrases onto the same hash (keep parity with
-  // packages/security/device-proof.mjs).
+  // the live copy at apps/control-plane/lib/device-proof.mjs).
   return crypto.createHash('sha256').update(credential, 'utf8').digest('hex');
 }
 

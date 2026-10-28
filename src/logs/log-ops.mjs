@@ -3,10 +3,12 @@
 // per handle with TTL. Prefer over repeated log_read polling.
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
+import path from 'node:path';
 import { realAllowed } from '../structured-ops/structured-ops.mjs';
 import { parseSince } from './system-log-ops.mjs';
 
-/** @type {Map<string, {file: string, ttlMs: number, updatedMs: number}>} */
+/** @type {Map<string, {file: string, roots: string[], identity: string, ttlMs: number, updatedMs: number}>} */
 const follows = new Map();
 const FOLLOW_TTL_MS = 30 * 60 * 1000;
 const MAX_FOLLOWS = 1000;
@@ -81,28 +83,60 @@ export function makeLogFollowHandlers({ logSources = {}, readRoots = [] } = {}) 
   };
   /**
    * @param {string} file
-   * @param {number} cursor
+   * @param {string[]} roots canonical roots pinned at start
+   * @param {number|null} cursor null requests a tail window
    * @param {number} maxBytes
+   * @param {string|null} [previousIdentity]
    */
-  const readFrom = async (file, cursor, maxBytes) => {
-    const st = await fs.stat(file);
-    let offset = Math.max(0, cursor);
-    let truncatedReset = false;
-    if (offset > st.size) {
-      offset = 0;
-      truncatedReset = true;
-    }
-    const len = Math.min(st.size - offset, maxBytes);
-    if (len <= 0) return { content: '', cursor: st.size, eof: true, truncatedReset };
-    const handle = await fs.open(file, 'r');
+  const readFrom = async (file, roots, cursor, maxBytes, previousIdentity = null) => {
+    // A pathname is not a lasting authorization. Recheck the original path on
+    // every open, then bind metadata and reads to the same verified descriptor.
+    const allowed = await realAllowed(file, roots, false);
+    const withinPinnedRoot = (/** @type {string} */ target) =>
+      roots.some((root) => target === root || target.startsWith(root.endsWith(path.sep) ? root : root + path.sep));
+    if (!withinPinnedRoot(allowed)) throw new Error('PATH_NOT_ALLOWED');
+    const expected = await fs.lstat(allowed);
+    if (!expected.isFile()) throw new Error('PATH_TYPE_NOT_SUPPORTED');
+    const handle = await fs.open(
+      allowed,
+      fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0) | (fsConstants.O_NONBLOCK || 0)
+    );
     try {
+      const st = await handle.stat();
+      if (!st.isFile()) throw new Error('PATH_TYPE_NOT_SUPPORTED');
+      if (st.dev !== expected.dev || st.ino !== expected.ino) throw new Error('PATH_NOT_ALLOWED');
+      // Linux exposes the actual opened object, including ancestor symlink
+      // substitutions; no read is allowed if descriptor resolution fails.
+      if (process.platform === 'linux') {
+        // Authorize the resolved target, not the procfs alias's directory chain.
+        const target = await fs.realpath(`/proc/self/fd/${handle.fd}`);
+        const opened = await realAllowed(target, roots, false);
+        if (opened !== allowed || !withinPinnedRoot(opened)) throw new Error('PATH_NOT_ALLOWED');
+      }
+      const checked = await realAllowed(file, roots, false);
+      const current = await fs.lstat(checked);
+      if (checked !== allowed || current.dev !== st.dev || current.ino !== st.ino)
+        throw new Error('PATH_NOT_ALLOWED');
+      const identity = `${st.dev}:${st.ino}`;
+      let offset = cursor === null ? Math.max(0, st.size - maxBytes) : Math.max(0, cursor);
+      let truncatedReset = false;
+      if (offset > st.size || (previousIdentity !== null && previousIdentity !== identity)) {
+        offset = 0;
+        truncatedReset = true;
+      }
+      const windowStart = offset;
+      const len = Math.min(st.size - offset, maxBytes);
+      if (len <= 0)
+        return { content: '', cursor: st.size, eof: true, truncatedReset, identity, windowStart };
       const buffer = Buffer.alloc(len);
       const { bytesRead } = await handle.read(buffer, 0, len, offset);
       return {
         content: buffer.subarray(0, bytesRead).toString('utf8'),
         cursor: offset + bytesRead,
         eof: offset + bytesRead >= st.size,
-        truncatedReset
+        truncatedReset,
+        identity,
+        windowStart
       };
     } finally {
       await handle.close();
@@ -128,18 +162,27 @@ export function makeLogFollowHandlers({ logSources = {}, readRoots = [] } = {}) 
         // Explicit paths are caller-controlled: gate them against read
         // roots (+sensitive denylist) exactly like the file tools instead
         // of trusting them verbatim (arbitrary-read hardening).
-        const file = explicit
-          ? await realAllowed(explicit, readRoots, false)
-          : resolveFile(String(p.source || ''), undefined);
+        const file = explicit || resolveFile(String(p.source || ''), undefined);
+        // Named sources authorize their configured directory, not arbitrary
+        // caller paths. Pin real roots so a later root symlink cannot widen it.
+        const roots = [];
+        for (const root of explicit ? readRoots : [path.dirname(file)]) {
+          try {
+            // Keep ignoring absent roots, but authorize the configured spelling
+            // before pinning: realpath alone erases untrusted alias containers.
+            await fs.stat(root);
+            roots.push(await realAllowed(root, [root], false, { cwd: process.cwd() }));
+          } catch (e) {
+            if (/** @type {NodeJS.ErrnoException} */ (e).code !== 'ENOENT') throw e;
+          }
+        }
         const maxLines = Math.max(1, Math.min(1000, Number(p.max_lines ?? 200)));
-        const st = await fs.stat(file);
-        const tailBytes = Math.min(st.size, maxLines * 512);
-        const windowStart = Math.max(0, st.size - tailBytes);
         // P2-13: read through EOF within the tailBytes window (readFrom caps
         // len to size-offset, so this is bounded to <=512KB, never unbounded).
         // The old 65536 cap read a MIDDLE chunk on files >~64KB and missed
         // the true tail.
-        const start = await readFrom(file, windowStart, tailBytes);
+        const start = await readFrom(file, roots, null, maxLines * 512);
+        const windowStart = start.windowStart;
         // Contract: at most maxLines COMPLETE lines. The byte window is
         // only a fetch heuristic: drop a leading partial line (the window
         // rarely starts on a line boundary — consumers cannot parse a
@@ -155,7 +198,7 @@ export function makeLogFollowHandlers({ logSources = {}, readRoots = [] } = {}) 
         // handles. Re-start of an already-held handle still overwrites
         // that same slot instead of refusing.
         if (follows.size >= MAX_FOLLOWS && !follows.has(handle)) return fail('FOLLOW_TABLE_FULL');
-        follows.set(handle, { file, ttlMs: FOLLOW_TTL_MS, updatedMs: Date.now() });
+        follows.set(handle, { file, roots, identity: start.identity, ttlMs: FOLLOW_TTL_MS, updatedMs: Date.now() });
         return ok({ handle, content, cursor: start.cursor, eof: start.eof });
       } catch (e) {
         const errorRecord = /** @type {{message?: unknown, code?: unknown}} */ (e);
@@ -170,7 +213,10 @@ export function makeLogFollowHandlers({ logSources = {}, readRoots = [] } = {}) 
         if (!f) return fail('UNKNOWN_HANDLE');
         f.updatedMs = Date.now();
         const maxBytes = Math.max(1, Math.min(262144, Number(p.max_bytes ?? 65536)));
-        const r = await readFrom(f.file, Math.max(0, Number(p.cursor ?? 0)), maxBytes);
+        const { identity, windowStart: _windowStart, ...r } = await readFrom(
+          f.file, f.roots, Math.max(0, Number(p.cursor ?? 0)), maxBytes, f.identity
+        );
+        f.identity = identity;
         return ok({ handle, ...r });
       } catch (e) {
         const errorRecord = /** @type {{message?: unknown, code?: unknown}} */ (e);

@@ -31,6 +31,8 @@ export const BROWSER_DEFAULTS = Object.freeze({
   maxSessionsPerClient: 5,
   maxConsoleEntries: 500,
   maxNetworkEntries: 500,
+  // L01a-5: bound on in-flight request-timing entries per context.
+  maxPendingEntries: 500,
   maxSnapshotChars: 20000,
   maxScreenshotBytes: 131072,
   maxDownloadBytes: 50 * 1024 * 1024,
@@ -141,31 +143,96 @@ export function resolveChromiumExecutable({
 }
 
 /**
- * @param {{root?: string|null, dataDir?: string|null, env?: NodeJS.ProcessEnv}} [options]
+ * Required managed-Chromium artifacts, verified as files (never directory
+ * names): the headless-shell executable that headless launches resolve and
+ * the full-chromium executable headed launches resolve. `playwright install
+ * chromium` downloads both sets as one unit, so a complete install satisfies
+ * both and a partial set is never mistaken for an installed one (HHC-PC
+ * 2026-10-17: a chromium-<rev> directory satisfied convergence while the
+ * headless-shell artifact browser_* tools need was missing).
+ * @param {{browsersDir?: string|null, revision?: string|null, platform?: string, arch?: string}} [options]
+ */
+export function managedBrowserArtifactStatus({
+  browsersDir = null,
+  revision = null,
+  platform = process.platform,
+  arch = process.arch
+} = {}) {
+  const headless = resolveChromiumExecutable({ browsersDir, revision, headless: true, platform, arch });
+  const headed = resolveChromiumExecutable({ browsersDir, revision, headless: false, platform, arch });
+  return {
+    ok: headless.ok && headed.ok,
+    headless: { ok: headless.ok, executablePath: headless.executablePath },
+    headed: { ok: headed.ok, executablePath: headed.executablePath },
+    tried: [...headless.tried, ...headed.tried]
+  };
+}
+
+/**
+ * @param {{base?: string|null, root?: string|null, dataDir?: string|null, env?: NodeJS.ProcessEnv}} [options]
  */
 export function resolveBrowserRuntime(options = {}) {
   const env = options.env || process.env;
-  let data = options.dataDir || env.NC_BROWSER_DATA_DIR || null;
-  if (!data) {
-    try {
-      data = ncLayout(options.root || undefined).data;
-    } catch {
-      data = null;
+  // Callers that already hold the browser base dir (boot convergence, core
+  // ensure) must resolve the SAME env-aware dirs as health/launch, or a
+  // download lands where no launch ever reads it (HHC-PC 2026-10-17:
+  // ensure reported installed:true while health reported
+  // BROWSER_INSTALLATION_MISSING on an operator-set browsers dir).
+  let base = options.base ? path.resolve(String(options.base)) : null;
+  if (!base) {
+    let data = options.dataDir || env.NC_BROWSER_DATA_DIR || null;
+    if (!data) {
+      try {
+        data = ncLayout(options.root || undefined).data;
+      } catch {
+        data = null;
+      }
     }
+    if (!data) data = env.NC_BROWSER_DATA_DIR || path.join(os.tmpdir(), 'nc-browser');
+    base = path.join(path.resolve(data), 'browser');
   }
-  if (!data) data = env.NC_BROWSER_DATA_DIR || path.join(os.tmpdir(), 'nc-browser');
-  const base = path.join(path.resolve(data), 'browser');
   const runtime = path.join(base, 'browser-runtime');
   return Object.freeze({
     base,
     runtime,
     coreDir: env.NC_PLAYWRIGHT_CORE_PATH || path.join(runtime, 'playwright-core'),
-    browsersDir: env.PLAYWRIGHT_BROWSERS_PATH || path.join(base, 'playwright-browsers'),
+    get browsersDir() { return env.PLAYWRIGHT_BROWSERS_PATH || path.join(base, 'playwright-browsers'); },
     stagingDir: path.join(base, 'playwright-browsers.staging'),
     profilesDir: path.join(base, 'profiles'),
     downloadsDir: path.join(base, 'downloads'),
     pin: BROWSER_RUNTIME_PIN
   });
+}
+
+const failedInstalledBrowsers = new Set();
+const browserPreparation = new Map();
+const convergenceRetries = new Map();
+
+/** One preflight choice for launch, health and convergence; never a login probe.
+ * @param {{coreDir?: string, browsersDir?: string, headless?: boolean, platform?: string, env?: NodeJS.ProcessEnv}} [options]
+ */
+export async function resolveBrowserProvider({ coreDir, browsersDir, headless = true, platform = process.platform, env = process.env } = {}) {
+  const rt = resolveBrowserRuntime({ env });
+  coreDir ||= rt.coreDir;
+  browsersDir ||= rt.browsersDir;
+  const operatorPath = Boolean(env.NC_PLAYWRIGHT_CORE_PATH) ||
+    Boolean(env.PLAYWRIGHT_BROWSERS_PATH && !(env === process.env && env.PLAYWRIGHT_BROWSERS_PATH === managedBrowsersPath));
+  if (!operatorPath && (platform === 'win32' || platform === 'darwin')) {
+    const brand = platform === 'darwin' ? 'chrome' : env.NC_BROWSER_DEFAULT_BRAND;
+    if (brand === 'chrome' || brand === 'edge') {
+      // Lazy import avoids eager cycles through the existing adapter facade.
+      const { findSystemBrowser } = await import('./browser-adapter.mjs');
+      const installed = findSystemBrowser(brand, { platform, env });
+      if (installed && !failedInstalledBrowsers.has(installed.path))
+        return { ok: true, provider: installed.type, installed: true, executablePath: installed.path, tried: [installed.path] };
+    }
+  }
+  return { ...resolveChromiumExecutable({ browsersDir, revision: expectedChromiumRevision(coreDir), headless }), provider: 'managed', installed: false };
+}
+
+/** Do not endlessly retry the same failed installed executable this process. */
+export function rejectInstalledBrowser(executablePath) {
+  failedInstalledBrowsers.add(executablePath);
 }
 
 /** @type {Record<string, any>|null} */
@@ -195,6 +262,12 @@ export async function loadPlaywrightCore(coreDir) {
   const pkg = readJsonFile(coreDir, 'package.json');
   const version = String(pkg?.version || '');
   if (version !== BROWSER_RUNTIME_PIN.playwright) throw new Error('BROWSER_VERSION_MISMATCH');
+  // Pin coupling (single source): the live core's declared chromium revision
+  // must be the revision the runtime pin (and therefore every launch's
+  // default executable resolution) expects. Otherwise health/gates check one
+  // revision while launches resolve another.
+  if (expectedChromiumRevision(coreDir) !== BROWSER_RUNTIME_PIN.chromiumRevision)
+    throw new Error('BROWSER_REVISION_MISMATCH');
   cachedCore = { ...mod, __version: version, __coreDir: coreDir };
   cachedCoreKey = coreDir;
   return cachedCore;
@@ -217,8 +290,12 @@ export function installedChromiumRevisions(browsersDir) {
   try {
     return fs
       .readdirSync(browsersDir, { withFileTypes: true })
-      .filter((e) => e.isDirectory() && /^chromium-/.test(e.name))
-      .map((e) => e.name.replace(/^chromium-/, ''));
+      // L01a-14: gate on the revision of the executable headless launches
+      // actually resolve (chromium_headless_shell-<rev>), not just the
+      // full-chromium dir — the old filter never matched headless-shell
+      // dirs (`chromium_` does not match /^chromium-/).
+      .filter((e) => e.isDirectory() && /^(chromium-|chromium_headless_shell-)/.test(e.name))
+      .map((e) => e.name.replace(/^(chromium-|chromium_headless_shell-)/, ''));
   } catch {
     return [];
   }
@@ -233,27 +310,33 @@ export function installedChromiumRevisions(browsersDir) {
  * No npm scripts ever run: the tarball is extracted with the safe
  * in-house extractor, never installed.
  * @param {string} base browser base dir (holds browser-runtime/)
- * @param {{pin?: string, pack?: ((dir: string, spec: string, timeoutMs?: number) => Promise<{ok: boolean, file?: string, error?: string}>), timeoutMs?: number}} [options]
+ * @param {{pin?: string, pack?: ((dir: string, spec: string, timeoutMs?: number, env?: NodeJS.ProcessEnv) => Promise<{ok: boolean, file?: string, error?: string}>), timeoutMs?: number}} [options]
  */
 export async function ensurePlaywrightCore(base, options = {}) {
   const pin = String(options.pin || BROWSER_RUNTIME_PIN.playwright || '');
   if (!/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(pin))
     return { ok: false, error: 'INVALID_BROWSER_RUNTIME_VERSION' };
-  const coreDir = path.join(base, 'browser-runtime', 'playwright-core');
+  // Same env-aware resolution as health/launch (see resolveBrowserRuntime).
+  const coreDir = resolveBrowserRuntime({ base }).coreDir;
   try {
     const pkg = JSON.parse(fs.readFileSync(path.join(coreDir, 'package.json'), 'utf8'));
     if (
       String(pkg?.name || '') === 'playwright-core' &&
       String(pkg?.version || '') === pin &&
-      fs.existsSync(path.join(coreDir, 'cli.js'))
+      fs.existsSync(path.join(coreDir, 'cli.js')) &&
+      (pin !== BROWSER_RUNTIME_PIN.playwright ||
+        expectedChromiumRevision(coreDir) === BROWSER_RUNTIME_PIN.chromiumRevision)
     )
       return { ok: true, current: true, version: pin };
   } catch {}
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-pwcore-'));
-  let phase = 'pack';
+  let tmp = null;
+  let phase = 'prepare';
   try {
+    const env = browserBootstrapEnv({ browsersDir: resolveBrowserRuntime({ base }).browsersDir });
+    tmp = fs.mkdtempSync(path.join(env.TMPDIR, 'nc-pwcore-'));
+    phase = 'pack';
     const pack = options.pack || defaultNpmPack;
-    const packed = await pack(tmp, `playwright-core@${pin}`, options.timeoutMs);
+    const packed = await pack(tmp, `playwright-core@${pin}`, options.timeoutMs, env);
     if (!packed || !packed.ok || !packed.file)
       throw new Error((packed && packed.error) || 'BROWSER_CORE_PACK_FAILED');
     phase = 'extract';
@@ -276,10 +359,46 @@ export async function ensurePlaywrightCore(base, options = {}) {
       throw new Error('BROWSER_VERSION_MISMATCH');
     if (!fs.existsSync(path.join(extracted, 'cli.js')))
       throw new Error('BROWSER_RUNTIME_MISSING');
+    // The JS version and the chromium revision are ONE pin: a tarball whose
+    // browsers.json revises away from the pin would strand every later
+    // health/gate check on a revision no launch resolves. Custom pins
+    // (explicit playwright version) cannot know a revision; only the
+    // canonical pin is revision-coupled.
+    if (
+      pin === BROWSER_RUNTIME_PIN.playwright &&
+      expectedChromiumRevision(extracted) !== BROWSER_RUNTIME_PIN.chromiumRevision
+    )
+      throw new Error('BROWSER_REVISION_MISMATCH');
     phase = 'promote';
-    rmrf(path.join(base, 'browser-runtime'));
-    fs.mkdirSync(path.join(base, 'browser-runtime'), { recursive: true });
-    fs.renameSync(extracted, coreDir);
+    // L01a-11: rename live -> .prev before extracted -> live (mirror
+    // activateStagedBrowserRuntime): the old rmrf-then-rename left no
+    // rollback copy when the rename failed midway.
+    const liveDir = path.join(base, 'browser-runtime');
+    const prevDir = path.join(base, 'browser-runtime.prev');
+    const managed = path.resolve(coreDir).startsWith(path.resolve(liveDir) + path.sep);
+    const previous = managed ? prevDir : coreDir + '.prev';
+    const active = managed ? liveDir : coreDir;
+    let savedPrevious = false;
+    try {
+      // Recover an old interrupted placement before recycling its only copy.
+      if (!fs.existsSync(active) && fs.existsSync(previous)) fs.renameSync(previous, active);
+      rmrf(previous);
+      if (managed) {
+        if (fs.existsSync(liveDir)) { fs.renameSync(liveDir, prevDir); savedPrevious = true; }
+        fs.mkdirSync(liveDir, { recursive: true });
+      } else {
+        // Operator-set core path: retain one rollback generation beside it.
+        fs.mkdirSync(path.dirname(coreDir), { recursive: true });
+        if (fs.existsSync(coreDir)) { fs.renameSync(coreDir, previous); savedPrevious = true; }
+      }
+      promoteDirectory(extracted, coreDir);
+    } catch (error) {
+      if (savedPrevious) {
+        rmrf(active);
+        try { fs.renameSync(previous, active); } catch {}
+      }
+      throw error;
+    }
     // Drop the loader cache so the fresh copy is picked up in-process.
     cachedCore = null;
     cachedCoreKey = null;
@@ -299,7 +418,7 @@ export async function ensurePlaywrightCore(base, options = {}) {
       stage: phase
     };
   } finally {
-    rmrf(tmp);
+    if (tmp) rmrf(tmp);
   }
 }
 
@@ -350,8 +469,9 @@ export function npmPackArgv(platform = process.platform, spec = 'playwright-core
  * @param {string} dir
  * @param {string} spec
  * @param {number} [timeoutMs]
+ * @param {NodeJS.ProcessEnv} [env]
  */
-function defaultNpmPack(dir, spec, timeoutMs) {
+function defaultNpmPack(dir, spec, timeoutMs, env) {
   return new Promise((resolve) => {
     if (!/^playwright-core@\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(String(spec || ''))) {
       resolve({ ok: false, error: 'BROWSER_CORE_PACK_FAILED' });
@@ -364,7 +484,7 @@ function defaultNpmPack(dir, spec, timeoutMs) {
     execFile(
       invoked.file,
       invoked.args,
-      { cwd: dir, timeout: Math.max(10000, Number(timeoutMs) || 300000), windowsHide: true },
+      { cwd: dir, env, timeout: Math.max(10000, Number(timeoutMs) || 300000), windowsHide: true },
       (error, stdout) => {
         if (error) {
           resolve({ ok: false, error: String((error && error.message) || error).slice(0, 200) });
@@ -394,20 +514,68 @@ function rmrf(p) {
 }
 
 /**
+ * Moves a directory into place across filesystem boundaries. rename(2) is
+ * atomic but cannot cross devices: on Linux os.tmpdir() is commonly tmpfs
+ * while the data tree is not, so the rename fails with EXDEV and every
+ * runtime install died at promote (ubuntu live 2026-10-17). Fallback: copy
+ * into a sibling temp dir on the DESTINATION filesystem and rename that
+ * into place, so the visible promote stays atomic and a failed copy cleans
+ * up after itself instead of exposing a half-populated directory.
+ * @param {string} src
+ * @param {string} dest
+ */
+function promoteDirectory(src, dest) {
+  try {
+    fs.renameSync(src, dest);
+    return;
+  } catch {
+    const staging = `${dest}.incoming-${process.pid}`;
+    rmrf(staging);
+    try {
+      fs.cpSync(src, staging, { recursive: true, force: true });
+      fs.renameSync(staging, dest);
+    } catch (error) {
+      rmrf(staging);
+      throw error;
+    }
+    rmrf(src);
+  }
+}
+
+/**
  * @param {string} cmd
  * @param {Array<string>} args
  * @param {Record<string, string>} [env]
  * @param {number} [timeoutMs]
  */
-function runCmd(cmd, args, env, timeoutMs = 600000) {
+/**
+ * L01a-12: exported for tests (buffer-cap regression pin).
+ * @param {string} cmd
+ * @param {Array<string>} args
+ * @param {Record<string, string|undefined>|undefined} env
+ * @param {number} [timeoutMs]
+ */
+export function runCmd(cmd, args, env, timeoutMs = 600000) {
   return new Promise((resolve) => {
     const child = spawn(cmd, args, {
-      env: { ...process.env, ...(env || {}) },
+      env: env || browserBootstrapEnv(),
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true
     });
     let out = '';
     let err = '';
+    // L01a-12: cap the running buffers per chunk (a chatty installer
+    // previously grew these strings without bound until the close slice).
+    const MAX_RUNCMD_BUF = 1024 * 1024;
+    const push = (d, which) => {
+      const text = String(d);
+      if (!text) return;
+      if (which === 0) {
+        if (out.length < MAX_RUNCMD_BUF) out += text.slice(0, MAX_RUNCMD_BUF - out.length);
+      } else if (err.length < MAX_RUNCMD_BUF) {
+        err += text.slice(0, MAX_RUNCMD_BUF - err.length);
+      }
+    };
     const timer = setTimeout(() => {
       try {
         child.kill('SIGKILL');
@@ -415,12 +583,8 @@ function runCmd(cmd, args, env, timeoutMs = 600000) {
       resolve({ ok: false, out, err: (err + '\nINSTALL_TIMEOUT').slice(-2000) });
     }, timeoutMs);
     if (timer.unref) timer.unref();
-    child.stdout.on('data', (d) => {
-      out += String(d);
-    });
-    child.stderr.on('data', (d) => {
-      err += String(d);
-    });
+    child.stdout.on('data', (d) => push(d, 0));
+    child.stderr.on('data', (d) => push(d, 1));
     child.on('error', (e) => {
       clearTimeout(timer);
       resolve({ ok: false, out, err: String((e && e.message) || e).slice(-2000) });
@@ -439,28 +603,55 @@ function runCmd(cmd, args, env, timeoutMs = 600000) {
  * @param {string} stagingDir
  */
 export function promoteStagedBrowserDirs(browsersDir, stagingDir) {
+  const prepared = [];
+  const switched = [];
   try {
     fs.mkdirSync(browsersDir, { recursive: true });
     const staged = fs.readdirSync(stagingDir);
-    let moved = 0;
     for (const name of staged) {
-      if (!/^(chromium-|chromium_headless_shell-|ffmpeg-)/.test(name)) continue;
+      if (!/^(chromium|chromium_headless_shell|ffmpeg)-[0-9]+$/.test(name)) continue;
       const target = path.join(browsersDir, name);
-      if (/^chromium-/.test(name)) {
-        rmrf(path.join(browsersDir, `${name}.prev`));
-        if (fs.existsSync(target)) fs.renameSync(target, path.join(browsersDir, `${name}.prev`));
-      } else {
-        rmrf(target);
-      }
-      try {
-        fs.renameSync(path.join(stagingDir, name), target);
-        moved++;
-      } catch {}
+      const incoming = `${target}.incoming-${process.pid}`;
+      const entry = { target, incoming, prev: `${target}.prev`, hadPrevious: false };
+      prepared.push(entry);
+      rmrf(incoming);
+      // Finish every copy on the destination filesystem before replacing
+      // either half of the verified headed/headless artifact set.
+      promoteDirectory(path.join(stagingDir, name), incoming);
     }
-    return { ok: moved > 0, moved };
+    for (const entry of prepared) {
+      if (!fs.existsSync(entry.target) && fs.existsSync(entry.prev))
+        fs.renameSync(entry.prev, entry.target);
+      rmrf(entry.prev);
+      entry.hadPrevious = fs.existsSync(entry.target);
+      if (entry.hadPrevious) fs.renameSync(entry.target, entry.prev);
+      switched.push(entry);
+      fs.renameSync(entry.incoming, entry.target);
+    }
+    return { ok: prepared.length > 0, moved: prepared.length };
   } catch {
+    for (const entry of switched.reverse()) {
+      rmrf(entry.target);
+      if (entry.hadPrevious) {
+        try { fs.renameSync(entry.prev, entry.target); } catch {}
+      }
+    }
     return { ok: false, moved: 0 };
+  } finally {
+    for (const entry of prepared) {
+      rmrf(entry.incoming);
+      rmrf(`${entry.incoming}.incoming-${process.pid}`);
+    }
   }
+}
+
+function browserPathsOverlap(a, b) {
+  const windows = process.platform === 'win32';
+  const api = windows ? path.win32 : path;
+  const normalize = value => windows ? api.resolve(value).toLowerCase() : api.resolve(value);
+  const left = normalize(a), right = normalize(b);
+  const prefix = value => value.endsWith(api.sep) ? value : value + api.sep;
+  return left === right || left.startsWith(prefix(right)) || right.startsWith(prefix(left));
 }
 
 /**
@@ -472,6 +663,8 @@ export function promoteStagedBrowserDirs(browsersDir, stagingDir) {
  */
 export async function stageBrowserInstall(options) {
   const { coreDir, browsersDir, stagingDir } = options;
+  if (browserPathsOverlap(browsersDir, stagingDir))
+    return { ok: false, error: 'BROWSER_INSTALLATION_MISSING', detail: 'active-staging-overlap' };
   const promote = options.promote !== false;
   const cli = path.join(coreDir, 'cli.js');
   if (!fs.existsSync(cli)) return { ok: false, error: 'BROWSER_RUNTIME_MISSING' };
@@ -487,12 +680,14 @@ export async function stageBrowserInstall(options) {
   // implied on Windows/macOS, and never during OTA (installer-only).
   if (options.withDeps === true && process.platform === 'linux') args.push('--with-deps');
   args.push('chromium');
-  const installed = await runCmd(
-    process.execPath,
-    [cli, ...args],
-    { PLAYWRIGHT_BROWSERS_PATH: stagingDir },
-    options.timeoutMs || 600000
-  );
+  let installed;
+  try {
+    installed = await runCmd(process.execPath, [cli, ...args],
+      browserBootstrapEnv({ browsersDir: stagingDir }), options.timeoutMs || 600000);
+  } catch (error) {
+    rmrf(stagingDir);
+    return { ok: false, error: 'BROWSER_INSTALLATION_MISSING', detail: String(error?.message || error) };
+  }
   if (!installed.ok) {
     rmrf(stagingDir);
     return { ok: false, error: 'BROWSER_INSTALLATION_MISSING', detail: installed.err };
@@ -501,6 +696,13 @@ export async function stageBrowserInstall(options) {
   if (!staged.includes(revision)) {
     rmrf(stagingDir);
     return { ok: false, error: 'BROWSER_VERSION_MISMATCH', detail: staged.join(',') };
+  }
+  // A revision directory name is not an artifact set: `install chromium`
+  // downloads the headless shell and the full chromium together, and a
+  // partial download must never pass as staged.
+  if (!managedBrowserArtifactStatus({ browsersDir: stagingDir, revision }).ok) {
+    rmrf(stagingDir);
+    return { ok: false, error: 'BROWSER_INSTALLATION_MISSING', detail: 'staged-artifacts-incomplete' };
   }
   // Validate BEFORE promoting: launch a blank page from the staged revision.
   const probe = await validateBrowserLaunch({
@@ -527,8 +729,11 @@ export async function stageBrowserInstall(options) {
   const promoted = promoteStagedBrowserDirs(browsersDir, stagingDir);
   rmrf(stagingDir);
   if (!promoted.ok) return { ok: false, error: 'BROWSER_INTERNAL_ERROR' };
+  applyBrowsersPathEnv(browsersDir);
   return { ok: true, revision, playwright: BROWSER_RUNTIME_PIN.playwright };
 }
+
+let managedBrowsersPath = null;
 
 /**
  * Playwright resolves browsers via PLAYWRIGHT_BROWSERS_PATH at launch time.
@@ -537,8 +742,9 @@ export async function stageBrowserInstall(options) {
  * @param {string} browsersDir
  */
 export function applyBrowsersPathEnv(browsersDir) {
-  if (!process.env.PLAYWRIGHT_BROWSERS_PATH) {
+  if (!process.env.PLAYWRIGHT_BROWSERS_PATH || process.env.PLAYWRIGHT_BROWSERS_PATH === managedBrowsersPath) {
     process.env.PLAYWRIGHT_BROWSERS_PATH = browsersDir;
+    managedBrowsersPath = browsersDir;
   }
   return process.env.PLAYWRIGHT_BROWSERS_PATH;
 }
@@ -554,24 +760,35 @@ export function applyBrowsersPathEnv(browsersDir) {
  */
 export async function activateBundledBrowserRuntime({ appDir, base }) {
   try {
-    const bundledPkg = readJsonFile(
-      path.join(appDir, 'browser-runtime', 'playwright-core'),
-      'package.json'
-    );
-    if (!bundledPkg || String(bundledPkg.version || '') !== BROWSER_RUNTIME_PIN.playwright)
+    const bundledDir = path.join(appDir, 'browser-runtime');
+    // No bundle in the payload is the normal shape today (runtimes come from
+    // upstream npm): report it honestly instead of a fabricated pin-mismatch
+    // (HHC-PC 2026-10-17 boot evidence).
+    if (!fs.existsSync(bundledDir)) return { promoted: false, reason: 'absent' };
+    const bundledCore = path.join(bundledDir, 'playwright-core');
+    const bundledPkg = readJsonFile(bundledCore, 'package.json');
+    // Pin acceptance covers BOTH halves of the coupled pin (JS version +
+    // chromium revision), so a bundle built against a different browser
+    // revision can never activate against this runtime pin.
+    if (
+      !bundledPkg ||
+      String(bundledPkg.version || '') !== BROWSER_RUNTIME_PIN.playwright ||
+      expectedChromiumRevision(bundledCore) !== BROWSER_RUNTIME_PIN.chromiumRevision
+    )
       return { promoted: false, reason: 'pin-mismatch' };
-    const livePkg = readJsonFile(
-      path.join(base, 'browser-runtime', 'playwright-core'),
-      'package.json'
-    );
-    if (livePkg && String(livePkg.version || '') === BROWSER_RUNTIME_PIN.playwright)
+    const liveCore = path.join(base, 'browser-runtime', 'playwright-core');
+    const livePkg = readJsonFile(liveCore, 'package.json');
+    if (
+      livePkg &&
+      String(livePkg.version || '') === BROWSER_RUNTIME_PIN.playwright &&
+      expectedChromiumRevision(liveCore) === BROWSER_RUNTIME_PIN.chromiumRevision
+    )
       return { promoted: false, reason: 'current' };
     const staged = path.join(base, 'browser-runtime.staging');
     rmrf(staged);
     fs.mkdirSync(staged, { recursive: true });
-    const bundled = path.join(appDir, 'browser-runtime');
-    for (const entry of fs.readdirSync(bundled)) {
-      fs.cpSync(path.join(bundled, entry), path.join(staged, entry), { recursive: true });
+    for (const entry of fs.readdirSync(bundledDir)) {
+      fs.cpSync(path.join(bundledDir, entry), path.join(staged, entry), { recursive: true });
     }
     return activateStagedBrowserRuntime(base);
   } catch {
@@ -590,21 +807,40 @@ export async function activateBundledBrowserRuntime({ appDir, base }) {
  * @param {string} base
  * @returns {Promise<{installed: boolean, revision?: string, error?: string, stage?: string, detail?: string}>}
  */
-export async function ensureManagedBrowsers(base) {
+export function ensureManagedBrowsers(base) {
+  if (browserPreparation.has(base)) return browserPreparation.get(base);
+  const pending = prepareManagedBrowsers(base).finally(() => browserPreparation.delete(base));
+  browserPreparation.set(base, pending);
+  return pending;
+}
+
+async function prepareManagedBrowsers(base) {
   try {
-    const browsersDir = path.join(base, 'playwright-browsers');
-    const revision = expectedChromiumRevision(
-      path.join(base, 'browser-runtime', 'playwright-core')
-    );
-    if (installedChromiumRevisions(browsersDir).includes(revision))
+    // Env-aware resolution shared with health/launch (resolveBrowserRuntime):
+    // an operator-set PLAYWRIGHT_BROWSERS_PATH or NC_PLAYWRIGHT_CORE_PATH
+    // must steer convergence too, or the download lands where nothing reads
+    // it (HHC-PC 2026-10-17: installed:true from ensure while health never
+    // found the artifacts).
+    const rt = resolveBrowserRuntime({ base });
+    const browsersDir = rt.browsersDir;
+    const coreDir = rt.coreDir;
+    const revision = expectedChromiumRevision(coreDir);
+    const provider = await resolveBrowserProvider({ coreDir, browsersDir });
+    if (provider.installed) {
+      if (!fs.existsSync(path.join(coreDir, 'cli.js')))
+        return { installed: false, error: 'BROWSER_RUNTIME_MISSING', stage: 'preflight' };
+      return { installed: true, revision, provider: provider.provider };
+    }
+    // Fast path only for a complete artifact set — the executable files
+    // launches resolve, never just a revision directory name.
+    if (managedBrowserArtifactStatus({ browsersDir, revision }).ok)
       return { installed: true, revision };
-    const coreDir = path.join(base, 'browser-runtime', 'playwright-core');
     if (!fs.existsSync(path.join(coreDir, 'cli.js')))
       return { installed: false, error: 'BROWSER_RUNTIME_MISSING', stage: 'preflight' };
     const staged = await stageBrowserInstall({
       coreDir,
       browsersDir,
-      stagingDir: path.join(base, 'playwright-browsers.staging'),
+      stagingDir: rt.stagingDir,
       withDeps: false,
       promote: true
     });
@@ -654,6 +890,29 @@ export function convergenceValidateOutcome({ stage = null, validateFails = 0 } =
 }
 
 /**
+ * One structured JSON line for a runtime-install failure in the retry path.
+ * console is the process log channel (client.mjs log() writes JSON lines and
+ * mirrors them to the console), so the real cause stays findable — before
+ * this, a swallowed EXDEV resurfaced only as the misleading preflight
+ * BROWSER_RUNTIME_MISSING (ubuntu live 2026-10-17).
+ * @param {{error: string, stage: string, detail?: string}} failure
+ */
+function logRuntimeInstallFailure(failure) {
+  try {
+    console.error(
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        level: 'error',
+        message: 'browser_runtime_install_failed',
+        error: failure.error,
+        stage: failure.stage,
+        detail: failure.detail
+      })
+    );
+  } catch {}
+}
+
+/**
  * Fire-and-forget background retry for failed convergence (SYN-BRW-003).
  * A single download/validation failure (transient CDN, slow disk) must not
  * defer browsers to the next process restart. Retries back off exponentially
@@ -666,34 +925,77 @@ export function convergenceValidateOutcome({ stage = null, validateFails = 0 } =
  * after 3 and report PLATFORM_BROWSER_FIX_NEEDED instead of burning
  * bandwidth in a download→validate→wipe loop. Download-stage failures
  * keep retrying (transient) without touching the validate counter.
- * @param {{base?: string|null, attempt?: number, validateFails?: number, onResult?: ((r: unknown) => unknown)|null}} [options]
+ * The runtime install is never swallowed: a failure (returned or thrown)
+ * is logged as browser_runtime_install_failed (error/stage/detail) and its
+ * cause replaces the downstream preflight error on the reported result, so
+ * the retry names the real cause (e.g. EXDEV) instead of a misleading
+ * BROWSER_RUNTIME_MISSING.
+ * @param {{base?: string|null, attempt?: number, validateFails?: number, onResult?: ((r: unknown) => unknown)|null, ensureCore?: ((base: string) => Promise<{ok?: unknown, error?: unknown, stage?: unknown, detail?: unknown}>), runAttempt?: ((work: () => Promise<void>) => unknown)}} [options]
  */
 export function scheduleConvergenceRetry({
   base = null,
   attempt = 1,
   validateFails = 0,
-  onResult = null
+  onResult = null,
+  ensureCore = ensurePlaywrightCore,
+  runAttempt = work => work()
 } = {}) {
   if (!base) return null;
+  if (convergenceRetries.has(base)) return convergenceRetries.get(base);
   const delay = convergenceRetryDelay(attempt);
   const timer = setTimeout(() => {
-    (async () => {
+    const run = async () => {
       try {
-        if (fs.existsSync(path.join(base, 'playwright-browsers.staging'))) return;
+        if (fs.existsSync(path.join(base, 'playwright-browsers.staging'))) {
+          convergenceRetries.delete(base);
+          return;
+        }
+        /** @type {{error: string, stage: string, detail?: string}|null} */
+        let coreFailure = null;
         try {
-          await ensurePlaywrightCore(base);
-        } catch {}
-        const r = /** @type {{installed?: unknown, error?: unknown, stage?: unknown}} */ (
+          const core = await ensureCore(base);
+          if (!core || core.ok !== true) {
+            coreFailure = {
+              error: String((core && core.error) || 'BROWSER_CORE_PACK_FAILED').slice(0, 300),
+              stage: String((core && core.stage) || 'unknown'),
+              detail: core && typeof core.detail === 'string' ? core.detail.slice(0, 300) : undefined
+            };
+          }
+        } catch (error) {
+          coreFailure = {
+            error: (error instanceof Error ? error.message : String(error)).slice(0, 300),
+            stage: 'unknown'
+          };
+        }
+        if (coreFailure) logRuntimeInstallFailure(coreFailure);
+        const managed = /** @type {{installed?: unknown, error?: unknown, stage?: unknown}} */ (
           await ensureManagedBrowsers(base)
         );
+        // A missing runtime makes the downstream preflight report the
+        // misleading BROWSER_RUNTIME_MISSING; the install failure is the
+        // real cause, so it replaces error/stage on the reported result.
+        const r =
+          coreFailure && managed && managed.installed !== true
+            ? {
+                ...managed,
+                error: coreFailure.error,
+                stage: coreFailure.stage,
+                runtime_install: coreFailure,
+                note: 'BROWSER_RUNTIME_INSTALL_FAILED'
+              }
+            : managed;
         if (onResult) {
           try {
             await onResult(r);
           } catch {}
         }
-        if (!r || r.installed === true) return;
+        if (!r || r.installed === true) {
+          convergenceRetries.delete(base);
+          return;
+        }
         const outcome = convergenceValidateOutcome({ stage: r.stage, validateFails });
         if (outcome.terminal) {
+          convergenceRetries.set(base, null);
           if (onResult) {
             try {
               await onResult({
@@ -705,16 +1007,27 @@ export function scheduleConvergenceRetry({
           }
           return;
         }
+        convergenceRetries.delete(base);
         scheduleConvergenceRetry({
           base,
           attempt: attempt + 1,
           validateFails: outcome.fails,
-          onResult
+          onResult,
+          ensureCore,
+          runAttempt
         });
-      } catch {}
-    })();
+      } catch { convergenceRetries.delete(base); }
+    };
+    // Agent-owned callers admit the entire attempt before either installer
+    // starts, and keep it in the handoff drain until all shared-tree work ends.
+    void (async () => runAttempt(run))().catch(() => {
+      convergenceRetries.delete(base);
+    }).finally(() => {
+      if (convergenceRetries.get(base) === timer) convergenceRetries.delete(base);
+    });
   }, delay);
   if (timer.unref) timer.unref();
+  convergenceRetries.set(base, timer);
   return timer;
 }
 
@@ -735,31 +1048,54 @@ export async function activateStagedBrowserRuntime(base) {
   const live = path.join(base, 'browser-runtime');
   const staged = path.join(base, 'browser-runtime.staging');
   const prev = path.join(base, 'browser-runtime.prev');
-  const stagedCore = path.join(staged, 'playwright-core');
-  const pkg = readJsonFile(stagedCore, 'package.json');
-  if (!pkg || String(pkg.version || '') !== BROWSER_RUNTIME_PIN.playwright) {
-    if (fs.existsSync(staged)) rmrf(staged);
-    return { promoted: false, reason: 'pin-mismatch' };
-  }
+  // Nothing staged is a no-op, not a pin verdict: releases carry no
+  // browser-runtime payload (npm convergence owns it), so every normal boot
+  // lands here and must not log a fabricated pin-mismatch.
+  if (!fs.existsSync(staged)) return { promoted: false, reason: 'absent' };
   const browsersDir = path.join(base, 'playwright-browsers');
   const stagingDir = path.join(base, 'playwright-browsers.staging');
+  const selected = resolveBrowserRuntime({ base }).browsersDir;
+  // A module-managed old staging selection can be repaired; an explicit
+  // operator-selected active tree must never be consumed as disposable state.
+  if (selected !== managedBrowsersPath &&
+      (browserPathsOverlap(selected, stagingDir) || browserPathsOverlap(selected, staged)))
+    return { promoted: false, reason: 'BROWSER_INSTALLATION_MISSING' };
+  const stagedCore = path.join(staged, 'playwright-core');
+  const pkg = readJsonFile(stagedCore, 'package.json');
+  // Pin acceptance covers BOTH halves of the coupled pin: the Playwright JS
+  // version and the chromium revision it resolves. A JS-only match could
+  // otherwise activate a runtime whose browsers.json diverges from the pin.
+  if (
+    !pkg ||
+    String(pkg.version || '') !== BROWSER_RUNTIME_PIN.playwright ||
+    expectedChromiumRevision(stagedCore) !== BROWSER_RUNTIME_PIN.chromiumRevision
+  ) {
+    rmrf(staged);
+    return { promoted: false, reason: 'pin-mismatch' };
+  }
   const revision = expectedChromiumRevision(stagedCore);
   // Promote the JS first: it is what the health gate and all later steps
   // execute. Binaries follow opportunistically below.
   try {
+    if (!fs.existsSync(live) && fs.existsSync(prev)) fs.renameSync(prev, live);
     rmrf(prev);
     if (fs.existsSync(live)) fs.renameSync(live, prev);
     fs.renameSync(staged, live);
   } catch {
+    if (!fs.existsSync(live) && fs.existsSync(prev)) {
+      try { fs.renameSync(prev, live); } catch {}
+    }
     return { promoted: false, reason: 'BROWSER_INTERNAL_ERROR' };
   }
+  cachedCore = null;
+  cachedCoreKey = null;
   // Binaries: live already has them, or staging validated them, or they
   // converge later via ensureManagedBrowsers (never a promotion blocker).
   let browsers = 'absent';
   try {
-    if (installedChromiumRevisions(browsersDir).includes(revision)) {
+    if (managedBrowserArtifactStatus({ browsersDir, revision }).ok) {
       browsers = 'live';
-    } else if (installedChromiumRevisions(stagingDir).includes(revision)) {
+    } else if (managedBrowserArtifactStatus({ browsersDir: stagingDir, revision }).ok) {
       const probe = await validateBrowserLaunch({
         coreDir: path.join(live, 'playwright-core'),
         browsersDir: stagingDir,
@@ -777,45 +1113,212 @@ export async function activateStagedBrowserRuntime(base) {
   } catch {
     browsers = 'BROWSER_INTERNAL_ERROR';
   }
+  const effective = applyBrowsersPathEnv(browsersDir);
+  if (effective !== browsersDir) {
+    const probe = await validateBrowserLaunch({ coreDir: resolveBrowserRuntime({ base }).coreDir,
+      browsersDir: effective, headless: true, timeoutMs: 60000 });
+    browsers = probe.ok && managedBrowserArtifactStatus({ browsersDir: effective, revision }).ok
+      ? 'live' : probe.error || 'BROWSER_INSTALLATION_MISSING';
+  }
   return { promoted: true, playwright: BROWSER_RUNTIME_PIN.playwright, revision, browsers };
 }
 
+/**
+ * Managed browser HOME dirs created by resolveBrowserServiceHome below.
+ * Removed on process exit (L06-8: mkdtemp dirs must not accumulate across
+ * restarts when the ambient HOME stays unwritable).
+ */
+const managedBrowserHomes = new Map();
+let browserHomeExitHooked = false;
+function trackManagedBrowserHome(dir, parentDir) {
+  managedBrowserHomes.set(String(dir), parentDir);
+  if (!browserHomeExitHooked) {
+    browserHomeExitHooked = true;
+    try {
+      process.once('exit', () => {
+        for (const dir of managedBrowserHomes.keys()) {
+          try {
+            fs.rmSync(dir, { recursive: true, force: true });
+          } catch {}
+        }
+        managedBrowserHomes.clear();
+      });
+    } catch {}
+  }
+}
 /**
  * Service-user browser HOME (SYN-BRW-004). Chromium CHECK-traps (SIGILL,
  * empty stderr, "browser has been closed") when the daemon user's HOME is
  * missing or unwritable — e.g. macOS `_nc` whose NFSHomeDirectory is
  * /var/empty. Healthy hosts keep their ambient HOME untouched; only an
  * unwritable HOME falls back to a managed 0700 dir under the data tree.
+ *
+ * L06-8: the ambient HOME is lstat-verified before use — a symlink (plant
+ * redirecting Chromium profiles/cache outside the owner's tree) or a
+ * foreign-UID directory fails closed with BROWSER_HOME_SECURITY_VIOLATION,
+ * UNLESS it is the standard install layout (foreign uid, but the directory
+ * belongs to the agent's PRIMARY GROUP and is neither group- nor
+ * other-writable — root:_nc 0750). A missing HOME still falls back to a
+ * managed dir; managed dirs are reused while valid and removed on exit.
  * @param {{browsersDir?: string|null, home?: string}} [options]
  */
 export function resolveBrowserServiceHome({ browsersDir = null, home = undefined } = {}) {
   const ambient = home === undefined ? process.env.HOME : home;
   if (typeof ambient === 'string' && ambient) {
+    assertBrowserStateAncestry(ambient);
+    // L06-8: lstat (never stat — a symlink must be seen, not followed).
+    let lst = null;
     try {
-      fs.accessSync(ambient, fs.constants.W_OK);
-      return { home: ambient, managed: false };
-    } catch {}
+      lst = fs.lstatSync(ambient);
+    } catch (e) {
+      // Missing HOME (ENOENT) falls through to the managed fallback
+      // below; any other lstat failure fails closed — an indeterminable
+      // HOME is not trusted.
+      if (!e || typeof e !== 'object' || /** @type {{code?: unknown}} */ (e).code !== 'ENOENT')
+        throw new Error('BROWSER_HOME_SECURITY_VIOLATION', { cause: e });
+    }
+    if (lst) {
+      if (lst.isSymbolicLink() || !lst.isDirectory()) throw new Error('BROWSER_HOME_SECURITY_VIOLATION');
+      if (typeof process.getuid === 'function' && lst.uid !== process.getuid()) {
+        // Install-layout exemption (ubuntu live 2026-10-17): the standard
+        // tree root (/opt/nc) is root:_nc 0750 — a foreign uid owned by the
+        // agent's PRIMARY GROUP with no group/other write bit. Only root
+        // can plant entries there, and the threat model is a foreign-USER
+        // plant, so the layout is trusted; the W_OK check below still
+        // decides usability (the tree root is intentionally not writable
+        // for the service user → managed fallback). Group/other-writable or
+        // foreign-group owners still fail closed.
+        const primaryGid = typeof process.getgid === 'function' ? process.getgid() : null;
+        const trustedLayout =
+          primaryGid !== null && lst.gid === primaryGid && (lst.mode & 0o022) === 0;
+        if (!trustedLayout) throw new Error('BROWSER_HOME_SECURITY_VIOLATION');
+      }
+      try {
+        fs.accessSync(ambient, fs.constants.W_OK);
+        return { home: ambient, managed: false };
+      } catch {}
+    }
   }
-  const managed = path.join(
-    browsersDir ? path.dirname(String(browsersDir)) : os.tmpdir(),
-    'browser-service-home'
-  );
-  fs.mkdirSync(managed, { recursive: true, mode: 0o700 });
+  // Reuse a still-valid managed dir instead of mkdtemp-ing a new one per
+  // call (bounds accumulation when the ambient HOME stays unwritable).
+  const layout = ncLayout();
+  const parentDir = path.resolve(browsersDir ? path.dirname(String(browsersDir))
+    : (layout?.data && fs.existsSync(layout.data) ? layout.data : os.tmpdir()));
+  assertBrowserStateAncestry(parentDir, true);
+  for (const [existing, parent] of managedBrowserHomes) {
+    if (parent !== parentDir) continue;
+    try {
+      const st = fs.lstatSync(existing);
+      if (st.isSymbolicLink()) continue;
+      if (typeof process.getuid === 'function' && st.uid !== process.getuid()) continue;
+      if (!st.isDirectory()) continue;
+      if (process.platform !== 'win32' && (st.mode & 0o077) !== 0) continue;
+      fs.accessSync(existing, fs.constants.W_OK);
+      return { home: existing, managed: true };
+    } catch {
+      try {
+        managedBrowserHomes.delete(existing);
+      } catch {}
+    }
+  }
+  fs.mkdirSync(parentDir, { recursive: true, mode: 0o700 });
+  if (typeof process.getuid === 'function') {
+    const parent = fs.lstatSync(parentDir);
+    const systemTemp = parent.uid === 0 && (parent.mode & 0o1000) !== 0;
+    if (parent.uid !== process.getuid() && !systemTemp)
+      throw new Error('BROWSER_HOME_SECURITY_VIOLATION');
+  }
+  const prefix = path.join(parentDir, 'nc-browser-home-');
+  const managed = fs.mkdtempSync(prefix);
+  const st = fs.lstatSync(managed);
+  if (st.isSymbolicLink()) {
+    throw new Error('BROWSER_HOME_SECURITY_VIOLATION');
+  }
+  if (typeof process.getuid === 'function' && st.uid !== process.getuid()) {
+    throw new Error('BROWSER_HOME_SECURITY_VIOLATION');
+  }
   try {
     fs.chmodSync(managed, 0o700);
   } catch {}
+  trackManagedBrowserHome(managed, parentDir);
   return { home: managed, managed: true };
 }
 
 /**
- * Environment for browser child processes (SYN-BRW-004): process env with
- * a guaranteed-writable HOME. Playwright's `env` defaults to process.env,
- * so this is a no-op override on healthy hosts.
+ * Current-user child environment shared with acquisition/install: verified
+ * HOME and private writable cache/temp. The daemon environment is unchanged.
  * @param {{browsersDir?: string|null}} [options]
  */
 export function browserLaunchEnv({ browsersDir = null } = {}) {
+  return browserBootstrapEnv({ browsersDir });
+}
+
+// State must not traverse a user-planted link or writable foreign ancestor.
+function assertBrowserStateAncestry(dir, includeLeaf = false) {
+  const target = path.resolve(dir);
+  let current = includeLeaf ? target : path.dirname(target);
+  for (;;) {
+    let st;
+    try { st = fs.lstatSync(current); } catch (error) {
+      if (error.code !== 'ENOENT') throw new Error('BROWSER_HOME_SECURITY_VIOLATION', { cause: error });
+    }
+    if (st) {
+      const systemAlias = process.platform === 'darwin' && current !== target &&
+        ['/var', '/tmp', '/etc'].includes(current) && st.uid === 0;
+      if ((st.isSymbolicLink() || !st.isDirectory()) && !systemAlias)
+        throw new Error('BROWSER_HOME_SECURITY_VIOLATION');
+      if (typeof process.getuid === 'function' && !systemAlias) {
+        const systemTemp = st.uid === 0 && (st.mode & 0o1000) !== 0;
+        if ((st.uid !== process.getuid() && st.uid !== 0) || ((st.mode & 0o022) !== 0 && !systemTemp))
+          throw new Error('BROWSER_HOME_SECURITY_VIOLATION');
+      }
+    }
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+}
+
+function browserStateDirectory(dir, create = false) {
+  assertBrowserStateAncestry(dir);
+  let st;
+  try { st = fs.lstatSync(dir); } catch (error) {
+    if (error.code !== 'ENOENT') throw new Error('BROWSER_HOME_SECURITY_VIOLATION', { cause: error });
+    if (!create) return;
+    fs.mkdirSync(dir, { mode: 0o700 });
+    st = fs.lstatSync(dir);
+  }
+  if (st.isSymbolicLink() || !st.isDirectory() ||
+      (typeof process.getuid === 'function' && st.uid !== process.getuid()) ||
+      (create && process.platform !== 'win32' && (st.mode & 0o077) !== 0))
+    throw new Error('BROWSER_HOME_SECURITY_VIOLATION');
+  try { fs.accessSync(dir, fs.constants.W_OK); } catch (error) {
+    if (create) throw new Error('BROWSER_HOME_SECURITY_VIOLATION', { cause: error });
+  }
+}
+
+/** Current-user child state only; no daemon environment mutation or OS elevation.
+ * @param {{browsersDir?: string|null}} [options]
+ */
+function browserBootstrapEnv({ browsersDir = null } = {}) {
   const { home } = resolveBrowserServiceHome({ browsersDir });
-  return { ...process.env, HOME: home };
+  for (const key of ['npm_config_cache', 'NPM_CONFIG_CACHE']) {
+    if (process.env[key]) browserStateDirectory(path.resolve(process.env[key]));
+  }
+  const state = path.join(home, '.nc-browser-bootstrap');
+  const cache = path.join(state, 'npm-cache');
+  const temp = path.join(state, 'tmp');
+  for (const dir of [state, cache, temp]) browserStateDirectory(dir, true);
+  // Keep platform/display/proxy/CA settings, not daemon credentials or Node
+  // loader/npm configuration injection. This is not a helper identity boundary.
+  const allowed = /^(PATH|Path|PATHEXT|SystemRoot|SYSTEMROOT|WINDIR|ComSpec|COMSPEC|LANG|LANGUAGE|LC_[A-Z_]+|TZ|DISPLAY|WAYLAND_DISPLAY|XAUTHORITY|XDG_RUNTIME_DIR|SSL_CERT_FILE|SSL_CERT_DIR|NODE_EXTRA_CA_CERTS|HTTPS?_PROXY|ALL_PROXY|NO_PROXY|https?_proxy|all_proxy|no_proxy|PLAYWRIGHT_DOWNLOAD_HOST|PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST|PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT)$/;
+  const child = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (allowed.test(key) && typeof value === 'string') child[key] = value;
+  }
+  return { ...child, HOME: home, USERPROFILE: home, npm_config_cache: cache,
+    TMPDIR: temp, TMP: temp, TEMP: temp, XDG_CACHE_HOME: state,
+    ...(browsersDir ? { PLAYWRIGHT_BROWSERS_PATH: browsersDir } : {}) };
 }
 
 /**
@@ -826,7 +1329,6 @@ export function browserLaunchEnv({ browsersDir = null } = {}) {
  */
 export async function validateBrowserLaunch(options) {
   const started = Date.now();
-  applyBrowsersPathEnv(options.browsersDir);
   const timeoutMs = options.timeoutMs || 60000;
   const headless = options.headless !== false;
   const resolved = resolveChromiumExecutable({
@@ -887,7 +1389,7 @@ export async function validateBrowserLaunch(options) {
 /**
  * Lightweight startup health: import + pin + executable presence. No launch
  * (launch validation runs on first browser_create and is cached).
- * @param {{coreDir?: string, browsersDir?: string}} [options]
+ * @param {{coreDir?: string, browsersDir?: string, platform?: string, env?: NodeJS.ProcessEnv}} [options]
  */
 export async function browserHealth(options = {}) {
   const rt = resolveBrowserRuntime();
@@ -914,15 +1416,25 @@ export async function browserHealth(options = {}) {
   }
   const revision = expectedChromiumRevision(coreDir);
   const installed = installedChromiumRevisions(browsersDir);
-  if (!installed.includes(revision))
+  const selected = await resolveBrowserProvider({ coreDir, browsersDir, platform: options.platform, env: options.env });
+  if (selected.installed)
+    return { available: true, error: null, playwright: version, revision, installed, provider: selected.provider };
+  // Health is the capability gate for browser_* tools: it must verify the
+  // executable artifacts a launch actually resolves (headless shell AND full
+  // chromium), never a revision directory name. HHC-PC 2026-10-17: a
+  // chromium-<rev> dir satisfied the old name check while the headless-shell
+  // artifact was missing, so tools were gated on a set that cannot launch.
+  const artifacts = managedBrowserArtifactStatus({ browsersDir, revision });
+  if (!artifacts.ok)
     return {
       available: false,
       error: 'BROWSER_INSTALLATION_MISSING',
       playwright: version,
       revision,
-      installed
+      installed,
+      artifacts
     };
-  return { available: true, error: null, playwright: version, revision, installed };
+  return { available: true, error: null, playwright: version, revision, installed, artifacts };
 }
 
 /**

@@ -12,12 +12,62 @@ const run = promisify(execFile);
 const MAX_ROWS = 50;
 
 /**
+ * Parse `mount` output into a mount -> fstype map. Accepts Linux
+ * (`/dev/sda1 on / type ext4 (...)`) and BSD/macOS (`/dev/disk3s1 on /
+ * (apfs, ...)`) shapes; first row wins per mount. Pure, exported for tests.
+ * @param {string} text
+ * @returns {Map<string, string>}
+ */
+export function parseMountFstypes(text) {
+  const map = new Map();
+  for (const raw of String(text || '').split('\n')) {
+    const line = raw.trim();
+    if (!line) continue;
+    let m = line.match(/^\S+ on (\S+) type (\S+)/);
+    if (m) {
+      if (!map.has(m[1])) map.set(m[1], m[2]);
+      continue;
+    }
+    m = line.match(/^\S+ on (\S+) \(([^,)]+)/);
+    if (m && m[2].trim() && !map.has(m[1])) map.set(m[1], m[2].trim());
+  }
+  return map;
+}
+
+/**
+ * fstype for df shapes without a type column (macOS `df -P` has none): a
+ * known mount -> fstype map wins when it names this mount, otherwise the
+ * truthful literal 'unknown' — never null (disk_usage output schema and the
+ * canonical registry twin type fstype as a non-null string; the agent was
+ * the drift). Pure, module-private; exercised through parseDfPosix.
+ * @param {string} mount @param {Map<string, string>|Record<string, string>|null} [fstypeByMount]
+ */
+function lookupKnownFstype(mount, fstypeByMount = null) {
+  try {
+    if (fstypeByMount instanceof Map) {
+      const v = fstypeByMount.get(mount);
+      if (typeof v === 'string' && v) return v;
+    } else if (fstypeByMount && typeof fstypeByMount === 'object') {
+      const v = fstypeByMount[/** @type {string} */ (mount)];
+      if (typeof v === 'string' && v) return v;
+    }
+  } catch {
+    // Fall through to 'unknown' below.
+  }
+  return 'unknown';
+}
+
+/**
  * Parse `df -P -B1` (POSIX) or `df -P -B1 -T` (GNU -T adds fstype).
  * df -P columns: filesystem 1B-blocks used available capacity mounted-on.
  * macOS df has no -B flag: callers pass `df -P -k` output with scale 1024.
+ * Without a type column there is no fstype to read: pass a mount -> fstype
+ * map (see parseMountFstypes) when one was collected cheaply, otherwise the
+ * rows carry the truthful literal 'unknown' — never null.
  * @param {string} text @param {boolean} [hasFstype] @param {number} [scale]
+ * @param {Map<string, string>|Record<string, string>|null} [fstypeByMount]
  */
-export function parseDfPosix(text, hasFstype = false, scale = 1) {
+export function parseDfPosix(text, hasFstype = false, scale = 1, fstypeByMount = null) {
   const mult = Number.isFinite(scale) && scale > 0 ? scale : 1;
   const out = [];
   for (const line of String(text || '').split('\n')) {
@@ -35,7 +85,7 @@ export function parseDfPosix(text, hasFstype = false, scale = 1) {
         }
       : {
           mount: parts[5],
-          fstype: null,
+          fstype: lookupKnownFstype(parts[5], fstypeByMount),
           total: Number(parts[1]),
           used: Number(parts[2]),
           free: Number(parts[3]),
@@ -58,6 +108,25 @@ export function parseDfPosix(text, hasFstype = false, scale = 1) {
 }
 
 /**
+ * Resolve a Get-PSDrive Provider cell to a truthful fstype string, never
+ * null. PowerShell serializes Provider as a ProviderInfo OBJECT (with a
+ * Name such as 'FileSystem'), so the old `typeof === 'string'` check was
+ * always null on real win32 output. A Name string wins; a ProviderInfo-like
+ * object without one falls back to 'FileSystem'; anything else is 'unknown'.
+ * Pure, exported for unit tests.
+ * @param {unknown} provider
+ */
+export function psDriveFstype(provider) {
+  if (typeof provider === 'string') return provider ? 'FileSystem' : 'unknown';
+  if (provider && typeof provider === 'object') {
+    const name = /** @type {Record<string, unknown>} */ (provider).Name;
+    if (typeof name === 'string' && name) return name;
+    return 'FileSystem';
+  }
+  return 'unknown';
+}
+
+/**
  * Parse `Get-PSDrive -PSProvider FileSystem` JSON rows.
  * @param {Array<Record<string, unknown>>} rows
  */
@@ -70,7 +139,7 @@ export function parsePsDrives(rows) {
     const total = used + free;
     out.push({
       mount: String(r.Root || r.Name || ''),
-      fstype: typeof r.Provider === 'string' ? 'FileSystem' : null,
+      fstype: psDriveFstype(r.Provider),
       total_bytes: total,
       used_bytes: used,
       free_bytes: free,
@@ -282,8 +351,18 @@ async function diskUsage(platform, focusPath, options = {}) {
   }
   if (platform === 'darwin') {
     // macOS df has no -B flag: -k reports 1K blocks, scaled to bytes.
+    // df -P also has no fstype column: collect `mount` best-effort (argv
+    // form, short timeout) so rows carry the real type; without it they
+    // carry the truthful literal 'unknown' — never null.
     const { stdout: darwinOut } = await run('df', ['-P', '-k'], { timeout: 20000 });
-    let rows = parseDfPosix(darwinOut, false, 1024);
+    let mountMap = null;
+    try {
+      const { stdout: mountOut } = await run('mount', [], { timeout: 8000 });
+      mountMap = parseMountFstypes(mountOut);
+    } catch {
+      mountMap = null;
+    }
+    let rows = parseDfPosix(darwinOut, false, 1024, mountMap);
     rows = rows.filter((r) => !r.mount.startsWith('/dev'));
     if (focusPath) rows = rows.filter((r) => r.mount === focusPath);
     return withDirectories(platform, focusPath, { platform, filesystems: rows }, { depth, oneFileSystem });
@@ -448,13 +527,31 @@ export function parseNetstatTcp(text) {
   return out;
 }
 
+/**
+ * PowerShell for win32 TCP rows, capped IN the pipeline. `Select-Object
+ * -First` sits after the state/port filters and before ConvertTo-Json so the
+ * agent never serializes an unbounded connection table (busy hosts); the
+ * JS-side slice + `truncated` flag downstream stay meaningful. Pure,
+ * exported for unit tests. No netstat fallback (locale fragility).
+ * @param {string} states already-quoted -State list, e.g. `'Listen'`
+ * @param {unknown} limit clamped to 1..500, default 100
+ * @param {number|null} port optional local port filter
+ */
+export function buildWinNetTcpScript(states, limit, port = null) {
+  const lim = Math.max(1, Math.min(500, Number(limit) || 100));
+  const localPort = Number(port);
+  const portFilter = Number.isInteger(localPort) && localPort >= 1 && localPort <= 65535
+    ? ` -LocalPort ${localPort}` : '';
+  // One extra matching row proves truncation without serializing the whole table.
+  return `Get-NetTCPConnection -State ${states}${portFilter} | Select-Object -First ${lim + 1} | Select-Object LocalAddress,LocalPort,RemoteAddress,RemotePort,State,OwningProcess | ConvertTo-Json -Compress -Depth 2`;
+}
+
 async function networkConnections(platform, { state = 'listen', port = null, limit = 100 } = {}) {
   const lim = Math.max(1, Math.min(500, Number(limit) || 100));
   let rows = [];
   if (platform === 'win32') {
     const states = state === 'all' ? "'Listen','Established'" : state === 'established' ? "'Established'" : "'Listen'";
-    const ps =
-      `Get-NetTCPConnection -State ${states} | Select-Object LocalAddress,LocalPort,RemoteAddress,RemotePort,State,OwningProcess | ConvertTo-Json -Compress -Depth 2`;
+    const ps = buildWinNetTcpScript(states, lim, port);
     const { stdout } = await run(
       'powershell.exe',
       ['-NoProfile', '-NonInteractive', '-Command', ps],
@@ -501,15 +598,23 @@ async function networkConnections(platform, { state = 'listen', port = null, lim
       }
     }
   } else {
+    // L01a-3: `ss -tlnpH` lists LISTEN sockets only, so running it for
+    // state=established then discarding the rows reported "no connections"
+    // on every host. Query established sockets directly (no -l).
     let text = '';
+    const wantEstablished = state === 'established';
     try {
-      ({ stdout: text } = await run('ss', ['-tlnpH'], { timeout: 25000 }));
+      ({ stdout: text } = await run('ss', [state === 'all' ? '-tanpH' : wantEstablished ? '-tnpH' : '-tlnpH'], {
+        timeout: 25000
+      }));
       rows = parseSsTcp(text);
     } catch {
-      ({ stdout: text } = await run('netstat', ['-tlnp'], { timeout: 25000 }));
+      ({ stdout: text } = await run('netstat', [state === 'all' ? '-tanp' : wantEstablished ? '-tnp' : '-tlnp'], {
+        timeout: 25000
+      }));
       rows = parseNetstatLinux(text);
     }
-    if (state === 'established') rows = [];
+    if (wantEstablished) rows = rows.filter((r) => r.state === 'ESTABLISHED');
   }
   if (port != null) rows = rows.filter((r) => r.local_port === Number(port));
   const truncated = rows.length > lim;

@@ -1,6 +1,9 @@
 import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
 import { runPrivilegedCapture } from './privileged-helper-spawn.mjs';
 import { winEventScript } from '../src/logs/system-log-ops.mjs';
+import { isSensitivePath } from '../src/filesystem/sensitive-paths.mjs';
 
 const SERVICE_CONTROL_OPS = Object.freeze(['start', 'stop', 'restart']);
 // First character excludes '-' and ':': the unit reaches sc.exe argv in
@@ -18,7 +21,9 @@ async function runCapture(cmd, args, timeoutMs = 30000) {
   // a taskkilled child with pipe-holding grandchildren hung the daemon
   // until the agent IPC watchdog fired (timeout + orphan). Same
   // {code,out,error} shape, plus timedOut for callers that want it.
-  const r = await runPrivilegedCapture(cmd, args, { timeoutMs, platform: 'win32' });
+  // L01b-3: never inherit the daemon env (tokens included) into privileged
+  // children — match the Linux inheritEnv:false policy.
+  const r = await runPrivilegedCapture(cmd, args, { timeoutMs, platform: 'win32', inheritEnv: false });
   return { code: r.code, out: r.out, error: r.error, timedOut: r.timedOut };
 }
 
@@ -72,7 +77,8 @@ export async function executeWindowsPrivilegedShell(payload) {
   const r = await runPrivilegedCapture(
     'powershell.exe',
     ['-NoProfile', '-NonInteractive', '-EncodedCommand', script],
-    { timeoutMs: timeoutSeconds * 1000, platform: 'win32' }
+    // L01b-3: a root PowerShell must never inherit the daemon env.
+    { timeoutMs: timeoutSeconds * 1000, platform: 'win32', inheritEnv: false }
   );
   const duration_ms = Date.now() - started;
   if (r.error)
@@ -307,6 +313,382 @@ export async function executeWindowsFilePermissions(payload) {
     current_owner: owner
   };
 }
+
+/**
+ * @param {string} target
+ * @param {object} [options]
+ * @param {boolean} [options.allowAll]
+ * @param {Array<string>} [options.roots]
+ * @param {boolean} [options.checkAncestor]
+ */
+function validateWindowsHelperPath(
+  target,
+  { allowAll = false, roots = [], checkAncestor = false } = {}
+) {
+  if (!target || typeof target !== 'string' || target.length > 4096)
+    throw new Error('PRIVILEGED_PAYLOAD_INVALID');
+  if (/[\x00-\x1f]/.test(target))
+    throw new Error('PRIVILEGED_PAYLOAD_INVALID');
+  if (!/^(?:[A-Za-z]:[\\/]|\\\\[?.]\\[A-Za-z]:[\\/])/.test(target))
+    throw new Error('PRIVILEGED_PAYLOAD_INVALID');
+  const noPrefix = target.replace(/^\\\\[?.]\\/, '');
+  const afterDrive = /^[A-Za-z]:/.test(noPrefix) ? noPrefix.slice(2) : noPrefix;
+  if (afterDrive.includes(':'))
+    throw new Error('PRIVILEGED_PAYLOAD_INVALID');
+  if (/\.\./.test(target))
+    throw new Error('PRIVILEGED_PATH_DENIED');
+  if (windowsTargetDenied(target))
+    throw new Error('PRIVILEGED_PATH_DENIED');
+  if (isSensitivePath(target, 'win32'))
+    throw new Error('PRIVILEGED_PATH_DENIED');
+
+  let resolvedTarget = null;
+  let targetExists = false;
+  try {
+    resolvedTarget = fs.realpathSync(target);
+    targetExists = true;
+  } catch {
+    targetExists = false;
+  }
+
+  if (targetExists && resolvedTarget) {
+    if (windowsTargetDenied(resolvedTarget))
+      throw new Error('PRIVILEGED_PATH_DENIED');
+    if (isSensitivePath(resolvedTarget, 'win32'))
+      throw new Error('PRIVILEGED_PATH_DENIED');
+  } else if (checkAncestor) {
+    let cur = path.win32.dirname(target);
+    let ancestorResolved = null;
+    while (true) {
+      try {
+        ancestorResolved = fs.realpathSync(cur);
+        break;
+      } catch {
+        const p = path.win32.dirname(cur);
+        if (p === cur) throw new Error('PRIVILEGED_PATH_DENIED');
+        cur = p;
+      }
+    }
+    if (windowsTargetDenied(ancestorResolved))
+      throw new Error('PRIVILEGED_PATH_DENIED');
+    if (isSensitivePath(ancestorResolved, 'win32'))
+      throw new Error('PRIVILEGED_PATH_DENIED');
+    resolvedTarget = ancestorResolved;
+  } else {
+    throw new Error('PRIVILEGED_FILE_NOT_FOUND');
+  }
+
+  if (allowAll !== true) {
+    if (!Array.isArray(roots) || roots.length === 0)
+      throw new Error('PRIVILEGED_PATH_DENIED');
+    const realRoots = [];
+    for (const r of roots) {
+      try {
+        realRoots.push(fs.realpathSync(r));
+      } catch {}
+    }
+    if (realRoots.length === 0)
+      throw new Error('PRIVILEGED_PATH_DENIED');
+    const normTarget = resolvedTarget.toLowerCase();
+    const inside = realRoots.some((rr) => {
+      const normRoot = rr.toLowerCase();
+      return (
+        normTarget === normRoot ||
+        normTarget.startsWith(normRoot.endsWith('\\') ? normRoot : normRoot + '\\')
+      );
+    });
+    if (!inside)
+      throw new Error('PRIVILEGED_PATH_DENIED');
+  }
+
+  return { target, resolvedTarget, exists: targetExists };
+}
+
+/**
+ * Refuse recursive operations over trees containing symlinks (L06-10
+ * Windows parity with the POSIX helpers): junctions and directory links
+ * would otherwise redirect a privileged recursive delete outside the
+ * gated tree. Uses lstat/dir-ent semantics (never follows). Bounded:
+ * absurdly deep trees fail closed rather than stalling the daemon.
+ * A readdirSync failure throws PRIVILEGED_PATH_DENIED (fail closed) —
+ * an unverifiable subtree is never waved through.
+ * @param {string} target
+ */
+export function assertNoSymlinksRecursive(target) {
+  // A file (non-directory) target has no tree to traverse: return early so
+  // a recursive op on a single file keeps working. Unresolvable targets
+  // fail closed (the exec cannot be verified).
+  let root;
+  try {
+    root = fs.lstatSync(target);
+  } catch (e) {
+    throw new Error('PRIVILEGED_PATH_DENIED', { cause: e });
+  }
+  if (!root.isDirectory()) return;
+  const stack = [target];
+  let dirs = 0;
+  while (stack.length) {
+    const cur = /** @type {string} */ (stack.pop());
+    let entries;
+    try {
+      entries = fs.readdirSync(cur, { withFileTypes: true });
+    } catch (e) {
+      throw new Error('PRIVILEGED_PATH_DENIED', { cause: e });
+    }
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) throw new Error('PRIVILEGED_PATH_DENIED');
+      if (entry.isDirectory()) {
+        if (++dirs > 100000) throw new Error('PRIVILEGED_PATH_DENIED');
+        stack.push(`${cur}\\${entry.name}`);
+      }
+    }
+  }
+}
+/**
+ * Bounded file read via privileged helper on Windows.
+ * @param {unknown} payload
+ */
+export async function executeWindowsFileRead(payload) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload))
+    throw new Error('PRIVILEGED_PAYLOAD_INVALID');
+  const rec = /** @type {Record<string, unknown>} */ (payload);
+  const target = String(rec.path || rec.target || '');
+  if (!target) throw new Error('PRIVILEGED_PAYLOAD_INVALID');
+  const allowAll = rec.allow_all === true || rec.allow_all_filesystem === true;
+  const roots = Array.isArray(rec.roots)
+    ? /** @type {Array<string>} */ (rec.roots)
+    : Array.isArray(rec.allowed_roots)
+      ? /** @type {Array<string>} */ (rec.allowed_roots)
+      : [];
+
+  validateWindowsHelperPath(target, { allowAll, roots, checkAncestor: false });
+
+  let st;
+  try {
+    st = fs.lstatSync(target);
+  } catch (e) {
+    if (e && typeof e === 'object' && /** @type {{code?: unknown}} */ (e).code === 'ENOENT') {
+      throw new Error('PRIVILEGED_FILE_NOT_FOUND', { cause: e });
+    }
+    throw new Error('PRIVILEGED_PATH_DENIED', { cause: e });
+  }
+  if (st.isSymbolicLink() || !st.isFile()) {
+    throw new Error('PRIVILEGED_PATH_DENIED');
+  }
+
+  const maxBytes = Math.max(1, Math.min(1024 * 1024, Number(rec.max_bytes || 65536)));
+  let fd;
+  try {
+    fd = fs.openSync(target, 'r');
+  } catch (openErr) {
+    const code =
+      openErr && typeof openErr === 'object'
+        ? /** @type {{code?: unknown}} */ (openErr).code
+        : null;
+    if (code === 'ENOENT') throw new Error('PRIVILEGED_FILE_NOT_FOUND', { cause: openErr });
+    throw new Error('PRIVILEGED_PATH_DENIED', { cause: openErr });
+  }
+  try {
+    const buf = Buffer.alloc(Math.min(st.size, maxBytes));
+    let readBytes = 0;
+    if (buf.length > 0) {
+      readBytes = fs.readSync(fd, buf, 0, buf.length, 0);
+    }
+    return {
+      path: target,
+      content: buf.subarray(0, readBytes).toString('utf8'),
+      bytes: st.size,
+      truncated: st.size > maxBytes,
+      success: true
+    };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * Bounded file mutation via privileged helper on Windows (write, edit, move, copy, delete, mkdir).
+ * @param {unknown} payload
+ */
+export async function executeWindowsFileWrite(payload) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload))
+    throw new Error('PRIVILEGED_PAYLOAD_INVALID');
+  const rec = /** @type {Record<string, unknown>} */ (payload);
+  const action = String(rec.action || 'write').toLowerCase();
+  const allowAll = rec.allow_all === true || rec.allow_all_filesystem === true;
+  const roots = Array.isArray(rec.roots)
+    ? /** @type {Array<string>} */ (rec.roots)
+    : Array.isArray(rec.allowed_roots)
+      ? /** @type {Array<string>} */ (rec.allowed_roots)
+      : [];
+
+  if (!['write', 'edit', 'move', 'copy', 'delete', 'mkdir'].includes(action))
+    throw new Error('PRIVILEGED_HELPER_OPERATION_NOT_ALLOWED');
+
+  if (action === 'delete') {
+    const target = String(rec.path || rec.target || '');
+    if (!target) throw new Error('PRIVILEGED_PAYLOAD_INVALID');
+    if (/^[A-Za-z]:[\\/]?$/.test(target)) throw new Error('PRIVILEGED_PATH_DENIED');
+    validateWindowsHelperPath(target, { allowAll, roots, checkAncestor: false });
+    let st;
+    try {
+      st = fs.lstatSync(target);
+    } catch (e) {
+      if (e && typeof e === 'object' && /** @type {{code?: unknown}} */ (e).code === 'ENOENT') {
+        return { action, path: target, deleted: false, success: true };
+      }
+      throw new Error('PRIVILEGED_PATH_DENIED', { cause: e });
+    }
+    if (st.isDirectory()) {
+      if (rec.recursive === true) {
+        // L06-10: refuse symlink/junction-containing trees before the
+        // privileged recursive delete (fail closed on unverifiable).
+        assertNoSymlinksRecursive(target);
+        fs.rmSync(target, { recursive: true, force: true });
+      } else {
+        fs.rmdirSync(target);
+      }
+    } else {
+      fs.unlinkSync(target);
+    }
+    return { action, path: target, deleted: true, success: true };
+  }
+
+  if (action === 'mkdir') {
+    const target = String(rec.path || rec.target || '');
+    if (!target) throw new Error('PRIVILEGED_PAYLOAD_INVALID');
+    validateWindowsHelperPath(target, { allowAll, roots, checkAncestor: true });
+    let exists = false;
+    try {
+      exists = fs.existsSync(target);
+    } catch {}
+    if (exists) {
+      return { action, path: target, created: false, success: true };
+    }
+    fs.mkdirSync(target, { recursive: rec.recursive !== false });
+    return { action, path: target, created: true, success: true };
+  }
+
+  if (action === 'move') {
+    const source = String(rec.source || rec.path || '');
+    const destination = String(rec.destination || rec.target || '');
+    if (!source || !destination) throw new Error('PRIVILEGED_PAYLOAD_INVALID');
+    validateWindowsHelperPath(source, { allowAll, roots, checkAncestor: false });
+    validateWindowsHelperPath(destination, { allowAll, roots, checkAncestor: true });
+    fs.mkdirSync(path.win32.dirname(destination), { recursive: true });
+    fs.renameSync(source, destination);
+    return { action, source, destination, success: true };
+  }
+
+  if (action === 'copy') {
+    const source = String(rec.source || rec.path || '');
+    const destination = String(rec.destination || rec.target || '');
+    if (!source || !destination) throw new Error('PRIVILEGED_PAYLOAD_INVALID');
+    validateWindowsHelperPath(source, { allowAll, roots, checkAncestor: false });
+    validateWindowsHelperPath(destination, { allowAll, roots, checkAncestor: true });
+    fs.mkdirSync(path.win32.dirname(destination), { recursive: true });
+    fs.cpSync(source, destination, { recursive: true, force: rec.overwrite === true });
+    return { action, source, destination, success: true };
+  }
+
+  if (action === 'edit') {
+    const target = String(rec.path || rec.target || '');
+    if (!target) throw new Error('PRIVILEGED_PAYLOAD_INVALID');
+    validateWindowsHelperPath(target, { allowAll, roots, checkAncestor: false });
+    let st;
+    try {
+      st = fs.lstatSync(target);
+    } catch {
+      throw new Error('PRIVILEGED_FILE_NOT_FOUND');
+    }
+    if (st.isSymbolicLink() || !st.isFile()) throw new Error('PRIVILEGED_PATH_DENIED');
+    const before = fs.readFileSync(target, 'utf8');
+    const prevSha = crypto.createHash('sha256').update(before).digest('hex');
+    if (rec.expected_sha256 && prevSha !== rec.expected_sha256)
+      throw new Error('PRIVILEGED_SHA_MISMATCH');
+    let after = before;
+    if (Array.isArray(rec.edits)) {
+      for (const edit of /** @type {Array<Record<string, unknown>>} */ (rec.edits)) {
+        const oldText = String(edit.old_text ?? '');
+        const newText = String(edit.new_text ?? '');
+        after = after.replace(oldText, () => newText);
+      }
+    } else if (rec.expected_text && rec.replacement_text) {
+      after = after.replace(String(rec.expected_text), () => String(rec.replacement_text));
+    } else if (typeof rec.content === 'string') {
+      after = rec.content;
+    }
+    const fd = fs.openSync(target, 'w');
+    try {
+      fs.writeSync(fd, Buffer.from(after, 'utf8'));
+    } finally {
+      fs.closeSync(fd);
+    }
+    const afterSha = crypto.createHash('sha256').update(after).digest('hex');
+    return {
+      action,
+      path: target,
+      bytes_written: Buffer.byteLength(after, 'utf8'),
+      previous_sha256: prevSha,
+      sha256: afterSha,
+      success: true
+    };
+  }
+
+  // action === 'write'
+  const target = String(rec.path || rec.target || '');
+  if (!target) throw new Error('PRIVILEGED_PAYLOAD_INVALID');
+  if (typeof rec.content !== 'string' || rec.content.length > 10 * 1024 * 1024)
+    throw new Error('PRIVILEGED_PAYLOAD_INVALID');
+  validateWindowsHelperPath(target, { allowAll, roots, checkAncestor: true });
+
+  const parent = path.win32.dirname(target);
+  fs.mkdirSync(parent, { recursive: true });
+
+  const mode = String(rec.mode || 'replace');
+  let prevSha = null;
+  let exists = false;
+  try {
+    const st = fs.lstatSync(target);
+    if (st.isSymbolicLink() || !st.isFile()) throw new Error('PRIVILEGED_PATH_DENIED');
+    exists = true;
+    if (mode === 'create' && st.size > 0) throw new Error('PRIVILEGED_FILE_EXISTS');
+    const existingContent = fs.readFileSync(target);
+    prevSha = crypto.createHash('sha256').update(existingContent).digest('hex');
+    if (rec.expected_sha256 && prevSha !== rec.expected_sha256)
+      throw new Error('PRIVILEGED_SHA_MISMATCH');
+  } catch (e) {
+    if (e && typeof e === 'object' && /** @type {{code?: unknown}} */ (e).code !== 'ENOENT') {
+      if (e instanceof Error && e.message.startsWith('PRIVILEGED_')) throw e;
+      throw new Error('PRIVILEGED_PATH_DENIED', { cause: e });
+    }
+  }
+
+  let fd;
+  try {
+    fd = fs.openSync(target, mode === 'append' ? 'a' : 'w');
+    fs.writeSync(fd, Buffer.from(rec.content, 'utf8'));
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+
+  let finalSha;
+  if (mode === 'append' && exists) {
+    finalSha = crypto.createHash('sha256').update(fs.readFileSync(target)).digest('hex');
+  } else {
+    finalSha = crypto.createHash('sha256').update(rec.content).digest('hex');
+  }
+
+  return {
+    action: 'write',
+    path: target,
+    bytes_written: Buffer.byteLength(rec.content, 'utf8'),
+    previous_sha256: prevSha,
+    sha256: finalSha,
+    success: true
+  };
+}
+
 /**
  * @param {object} [options]
  * @param {string} [options.uninstallScript]
@@ -322,6 +704,8 @@ export function windowsPrivilegedHelperHandlers({
     package_control: executeWindowsPackageControl,
     system_log_read: executeWindowsSystemLogRead,
     file_permissions: executeWindowsFilePermissions,
+    file_read: executeWindowsFileRead,
+    file_write: executeWindowsFileWrite,
     client_uninstall: async (/** @type {unknown} */ payload) => {
       if (!payload || typeof payload !== 'object' || Array.isArray(payload))
         throw new Error('PRIVILEGED_PAYLOAD_INVALID');
@@ -610,19 +994,34 @@ export async function executeWindowsSystemLogRead(payload) {
   });
   void WINDOWS_EVENT_LOGS;
   const utf8Script = `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ${script}`;
-  const r = await runCapture(
+  // Keep the existing capture budget while retaining its truncation flags.
+  const r = await runPrivilegedCapture(
     'powershell.exe',
     ['-NoProfile', '-NonInteractive', '-Command', utf8Script],
-    30000
+    { timeoutMs: 30000, platform: 'win32', inheritEnv: false }
   );
   if (r.error) throw new Error(`PRIVILEGED_LOG_SPAWN_FAILED:${r.error}`.slice(0, 200));
-  if (r.code === 0)
+  if (r.code === 0) {
+    try {
+      if (r.stdoutTruncated || r.stderrTruncated || r.stderr || r.stdout.length > 8000)
+        throw new Error('LOG_READ_FAILED');
+      const parsed = JSON.parse(r.stdout);
+      const rows = Array.isArray(parsed) ? parsed : [parsed];
+      if (rows.some((row) => !row || typeof row !== 'object' || Array.isArray(row) || !Object.hasOwn(row, 'Message')))
+        throw new Error('LOG_READ_FAILED');
+    } catch {
+      return { source, unit: provider, success: false, message: 'LOG_READ_FAILED' };
+    }
     return {
       source,
       unit: provider,
       success: true,
-      output_tail: r.out.slice(-8000) || null
+      output_tail: r.stdout
     };
+  }
+  // Match only the builder's private exit signal, not an echoed script/marker.
+  if (r.code === 65 && !r.stdout && !r.stderr && !r.stdoutTruncated && !r.stderrTruncated && !r.timedOut)
+    return { source, unit: provider, success: false, message: 'LOG_READ_FAILED' };
   return {
     source,
     unit: provider,

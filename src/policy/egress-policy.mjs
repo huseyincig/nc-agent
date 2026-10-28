@@ -143,6 +143,38 @@ export function unwrapV6(ip) {
     return { kind: 'v4', ip: `${b0}.${b1}.${b2}.${b3}` };
   }
 
+  // Check for NAT64 64:ff9b::/96 (RFC 6052): first 96 bits are
+  // 0064:ff9b:0000:0000:0000:0000, last 32 bits carry the IPv4 address.
+  // Without this unwrap the v4 deny rules (metadata, loopback) miss
+  // translated addresses. Exclude the reserved ::ffff:0:0/96-adjacent
+  // all-zero and ::1 tails the same way the ::/96 check below does.
+  if (
+    hextets[0] === 0x64 &&
+    hextets[1] === 0xff9b &&
+    hextets[2] === 0 &&
+    hextets[3] === 0 &&
+    hextets[4] === 0 &&
+    hextets[5] === 0 &&
+    !(hextets[6] === 0 && hextets[7] === 0) &&
+    !(hextets[6] === 0 && hextets[7] === 1)
+  ) {
+    const b0 = (hextets[6] >> 8) & 0xff;
+    const b1 = hextets[6] & 0xff;
+    const b2 = (hextets[7] >> 8) & 0xff;
+    const b3 = hextets[7] & 0xff;
+    return { kind: 'v4', ip: `${b0}.${b1}.${b2}.${b3}` };
+  }
+
+  // Check for 6to4 2002::/16 (RFC 3056): bits 16-47 carry the IPv4
+  // address (2002:aabb:ccdd::/48). Unwrap so v4 deny rules apply.
+  if (hextets[0] === 0x2002) {
+    const b0 = (hextets[1] >> 8) & 0xff;
+    const b1 = hextets[1] & 0xff;
+    const b2 = (hextets[2] >> 8) & 0xff;
+    const b3 = hextets[2] & 0xff;
+    return { kind: 'v4', ip: `${b0}.${b1}.${b2}.${b3}` };
+  }
+
   // Check for IPv4-compatible IPv6: ::/96 (deprecated but still routable,
   // e.g. ::127.0.0.1, ::169.254.169.254). Unwrap the embedded IPv4 so the
   // existing v4 deny rules (loopback, link-local, metadata) apply. Exclude

@@ -14,8 +14,8 @@ import { darwinPrivilegedHelperHandlers } from './privileged-helper-darwin-opera
 
 // Canonical macOS system-install paths (mirror the Linux layout; the
 // LaunchDaemon runs as root, the agent as its service account).
-export const DARWIN_HELPER_CONFIG = '/opt/nc/config/privileged-helper.json';
-export const DARWIN_HELPER_PUBLIC_KEY = '/opt/nc/config/privileged-helper-public.pem';
+export const DARWIN_HELPER_CONFIG = '/opt/nc/libexec/privileged-helper/privileged-helper.json';
+export const DARWIN_HELPER_PUBLIC_KEY = '/opt/nc/libexec/privileged-helper/privileged-helper-public.pem';
 export const DARWIN_PEERCRED_BINARY = '/opt/nc/libexec/nc-darwin-peercred';
 const CLIENT_ID_RE = /^nc_[0-9a-f]{64}$/;
 

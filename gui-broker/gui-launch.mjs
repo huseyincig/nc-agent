@@ -7,6 +7,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { ncLayout } from '../src/client/nc-paths.mjs';
 import { validateEgressUrl } from '../src/policy/egress-policy.mjs';
 import { policyFromJob } from '../src/browser/browser-manager.mjs';
+import { captureSpawnIdentity, verifyProcessStartTime } from '../src/process/process-sessions.mjs';
 
 /**
  * Synchronous broker-presence probe for capability advertisement: true
@@ -314,20 +315,27 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const parseJsonText = (text) => JSON.parse(String(text).replace(/^\uFEFF/, ''));
 
 /**
- * PIDs this agent incarnation launched via gui_launch (pid -> {at, app}).
+ * PIDs this agent incarnation launched via gui_launch (pid -> {at, app, exec, identity}).
  * gui_close only accepts these: closing foreign PIDs would exceed the
  * granted privilege (launch allowlisted apps, not manage the session).
  * The app tag enables POSIX re-correlation when the launcher stub already
- * exited (see resolveGuiPidPosix).
+ * exited (see resolveGuiPidPosix); `at`/`exec` form the recorded launch
+ * descriptor the verified close paths check the live process against
+ * (R-C3/R-C4: start-time/exec identity, fail closed).
  */
-const launchedGuiPids = /** @type {Map<number, {at: number, app: string}>} */ (new Map());
+const launchedGuiPids = /** @type {Map<number, {at: number, app: string, exec?: string, identity?: ReturnType<typeof captureSpawnIdentity>}>} */ (new Map());
 const LAUNCHED_PID_TTL_MS = 24 * 60 * 60 * 1000;
 const LAUNCHED_PID_MAX = 1000;
-/** @param {unknown} pid @param {unknown} [app] */
-function trackLaunchedGuiPid(pid, app = '') {
+/** @param {unknown} pid @param {unknown} [app] @param {unknown} [exec] @param {ReturnType<typeof captureSpawnIdentity>} [identity] */
+function trackLaunchedGuiPid(pid, app = '', exec = '', identity = null) {
   const id = Number(pid);
   if (!Number.isInteger(id) || id <= 0) return;
-  launchedGuiPids.set(id, { at: Date.now(), app: String(app || '') });
+  launchedGuiPids.set(id, {
+    at: Date.now(),
+    app: String(app || ''),
+    identity,
+    ...(typeof exec === 'string' && exec ? { exec } : {})
+  });
   if (launchedGuiPids.size > LAUNCHED_PID_MAX) {
     const oldest = [...launchedGuiPids.entries()].sort(
       (/** @type {[number, {at: number}]} */ a, /** @type {[number, {at: number}]} */ b) =>
@@ -339,6 +347,14 @@ function trackLaunchedGuiPid(pid, app = '') {
 /** @param {unknown} pid */
 function untrackLaunchedGuiPid(pid) {
   launchedGuiPids.delete(Number(pid));
+}
+/** Test-only: seed the launched-PID registry without a real launch. */
+export function __testTrackLaunchedGuiPid(pid, app = '', exec = '', identity = null) {
+  trackLaunchedGuiPid(pid, app, exec, identity);
+}
+/** Test-only: drop everything from the launched-PID registry. */
+export function __testClearLaunchedGuiPids() {
+  launchedGuiPids.clear();
 }
 /** @param {unknown} pid */
 function isLaunchedGuiPid(pid) {
@@ -352,7 +368,7 @@ function isLaunchedGuiPid(pid) {
   }
   return true;
 }
-/** @param {unknown} pid @returns {{at: number, app: string}|null} */
+/** @param {unknown} pid @returns {{at: number, app: string, exec?: string, identity?: ReturnType<typeof captureSpawnIdentity>}|null} */
 function launchedGuiRecord(pid) {
   if (!isLaunchedGuiPid(pid)) return null;
   return launchedGuiPids.get(Number(pid)) || null;
@@ -516,7 +532,7 @@ export function hasGuiDisplay(platform = process.platform, env = process.env, op
 }
 
 /**
- * Spawn a GUI app visibly and detached. Resolves with the child PID;
+ * Spawn a GUI app visibly and detached. Resolves with the child PID and identity;
  * rejects with GUI_APP_NOT_FOUND when the executable is missing.
  * @param {string} cmd
  * @param {Array<string>} args
@@ -524,10 +540,12 @@ export function hasGuiDisplay(platform = process.platform, env = process.env, op
 function spawnGuiApp(cmd, args) {
   return new Promise((resolve, reject) => {
     let child;
+    let identity;
     try {
       // WIN-HIDE-EXEMPT: the launched app itself must be visible (product
       // behavior); only this line may spawn without windowsHide.
       child = spawn(cmd, args, { detached: true, stdio: 'ignore' });
+      identity = captureSpawnIdentity(child);
     } catch (e) {
       reject(new Error('GUI_APP_NOT_FOUND'));
       return;
@@ -537,7 +555,7 @@ function spawnGuiApp(cmd, args) {
     );
     if (child.pid) {
       child.unref();
-      resolve(child.pid);
+      resolve({ pid: child.pid, identity });
     }
   });
 }
@@ -582,8 +600,8 @@ export function makeGuiLaunchHandler({
         // context, no broker hop. Visible by design.
         const target = cleanTarget(app, p.target);
         const spec = posixLaunchSpec(app, target, platform);
-        const pid = await spawnGuiApp(spec.cmd, spec.args);
-        trackLaunchedGuiPid(pid, app);
+        const { pid, identity } = await spawnGuiApp(spec.cmd, spec.args);
+        trackLaunchedGuiPid(pid, app, spec.cmd, identity);
         return {
           ...ok({ application: app, target, pid }),
           duration_ms: Date.now() - started
@@ -612,7 +630,13 @@ export function makeGuiLaunchHandler({
           await fs.rm(resultFile, { force: true });
           if (!r.ok) throw new Error(r.error || 'GUI_LAUNCH_FAILED');
           const finalPid = await resolveGuiPid(app, r.pid, platform, started);
-          trackLaunchedGuiPid(finalPid, app);
+          // R-C3: retain the broker-reported executable for the verified
+          // close (start-time/exec descriptor travels back in close requests).
+          trackLaunchedGuiPid(
+            finalPid,
+            app,
+            typeof r.exec === 'string' && r.exec ? r.exec : ''
+          );
           return {
             ...ok({
               application: app,
@@ -641,10 +665,8 @@ export function makeGuiLaunchHandler({
  * Close a GUI application previously launched via gui_launch. Only PIDs
  * recorded by trackLaunchedGuiPid are accepted; anything else fails closed
  * with GUI_PID_NOT_MANAGED instead of touching foreign processes.
- * POSIX launchers (/usr/bin/open, xdg-open, editor CLIs) exit right after
- * handoff, so a dead stub re-correlates to the real app process when the
- * app is unambiguous and started at/after launch (resolveGuiPidPosix);
- * unmapped apps and pre-existing instances keep failing closed.
+ * POSIX close requires the recorded launch PID and its exact identity;
+ * a re-correlated successor has no verified ownership relation and is refused.
  * @param {object} [options]
  * @param {ReturnType<typeof import('../src/client/nc-paths.mjs').ncLayout>} [options.layout]
  * @param {string} [options.platform]
@@ -689,12 +711,25 @@ export function makeGuiCloseHandler({
         throw new Error('GUI_PID_NOT_MANAGED');
       }
       if (platform !== 'win32') {
-        // POSIX kill with re-correlation: the tracked PID is usually the
-        // already-exited launcher stub. Resolve it to the live app process
-        // first; signal SIGTERM, escalate to SIGKILL, verify gone.
+        // POSIX: only the recorded launch PID can use its captured identity.
         const rec = launchedGuiRecord(pid);
         const target = await resolveGuiPidPosix(rec?.app || '', pid, platform, rec?.at || 0);
-        if (target === null) throw new Error('GUI_CLOSE_FAILED');
+        // Name/time re-correlation is not ownership proof for a different PID.
+        if (target === null || target !== pid) throw new Error('GUI_CLOSE_FAILED');
+        // R-C4: verify start-time identity BEFORE the initial SIGTERM
+        // (fail closed). The old code verified only at SIGKILL escalation,
+        // so the first signal could hit a recycled PID.
+        const startedIso =
+          rec?.at && Number.isFinite(Number(rec.at))
+            ? new Date(Number(rec.at)).toISOString()
+            : null;
+        let pre = null;
+        try {
+          pre = startedIso ? await verifyProcessStartTime(target, startedIso, { platform, expectedIdentity: rec?.identity }) : null;
+        } catch {
+          pre = null;
+        }
+        if (pre !== true) throw new Error('GUI_CLOSE_FAILED');
         const isDead = async () => {
           try {
             process.kill(target, 0);
@@ -718,9 +753,13 @@ export function makeGuiCloseHandler({
           await sleep(150);
         }
         if (!(await isDead())) {
-          try {
-            process.kill(target, 'SIGKILL');
-          } catch {}
+          const verified =
+            startedIso ? await verifyProcessStartTime(target, startedIso, { platform, expectedIdentity: rec?.identity }) : null;
+          if (verified === true) {
+            try {
+              process.kill(target, 'SIGKILL');
+            } catch {}
+          }
           const t1 = Date.now();
           while (Date.now() - t1 < 3000) {
             if (await isDead()) break;
@@ -731,7 +770,7 @@ export function makeGuiCloseHandler({
         untrackLaunchedGuiPid(pid);
         return { ...ok({ pid, closed: true }), duration_ms: Date.now() - started };
       }
-      // Single-instance/Store handoff parity with the POSIX branch above:
+      // Windows retains single-instance/Store handoff re-correlation:
       // the tracked PID is often the already-exited launcher stub by close
       // time. Re-correlate to the live app process with the same resolver
       // launch used before asking the broker; otherwise close aims at a dead
@@ -748,7 +787,18 @@ export function makeGuiCloseHandler({
         results = path.join(layout.data, 'gui-results');
       await fs.mkdir(queue, { recursive: true });
       await fs.mkdir(results, { recursive: true });
-      const req = { id, action: 'close', pid: target, created_at: new Date().toISOString() };
+      // R-C3: carry the recorded launch descriptor so the broker can
+      // verify start-time/exec identity before signalling (fail closed).
+      const req = {
+        id,
+        action: 'close',
+        pid: target,
+        created_at: new Date().toISOString(),
+        ...(rec?.at && Number.isFinite(Number(rec.at))
+          ? { startedAt: new Date(Number(rec.at)).toISOString() }
+          : {}),
+        ...(typeof rec?.exec === 'string' && rec.exec ? { exec: rec.exec } : {})
+      };
       const tmp = path.join(queue, `.${id}.tmp`),
         file = path.join(queue, `${id}.json`);
       await fs.writeFile(tmp, JSON.stringify(req) + '\n', { mode: 0o640 });

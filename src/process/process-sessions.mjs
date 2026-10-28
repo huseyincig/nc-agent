@@ -7,7 +7,11 @@ import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
-import { filterInheritedEnv, guardedCwd, shedChildPriority } from '../client/shell-runner.mjs';
+import {
+  filterInheritedEnv,
+  guardedCwd,
+  shedChildPriority
+} from '../client/shell-runner.mjs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -25,7 +29,44 @@ const STREAM_CAP_BYTES = 4 * 1024 * 1024;
 const MAX_SESSIONS = 2000;
 const MAX_INPUT_BYTES = 256 * 1024;
 const SWEEP_KILL_GRACE_MS = 3000;
-const SWEEP_VERIFY_TOLERANCE_MS = 120 * 1000;
+/** @typedef {{platform: 'linux', bootId: string, startTimeTicks: string}|{platform: 'win32', creationIdentity: string}} ProcessIdentity */
+/** @type {WeakMap<object, ProcessIdentity|null>} */
+const childIdentities = new WeakMap();
+
+/** Read the kernel identity, never an approximate wall-clock birth time.
+ * @param {number} pid
+ * @returns {ProcessIdentity|null}
+ */
+function linuxProcessIdentity(pid) {
+  if (!Number.isInteger(pid) || pid < 2) return null;
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const end = stat.lastIndexOf(')');
+    if (end < 0 || !stat.startsWith(`${pid} (`)) return null;
+    const ticks = stat.slice(end + 1).trim().split(/\s+/)[19];
+    const bootId = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+    if (!/^[0-9]+$/.test(ticks || '') || !/^[a-f0-9-]{36}$/i.test(bootId)) return null;
+    return Object.freeze({ platform: 'linux', bootId, startTimeTicks: ticks });
+  } catch { return null; }
+}
+
+/** Capture synchronously at the spawn boundary, before yielding or PID reuse.
+ * Windows/macOS remain unverifiable without a trusted native spawn companion.
+ * @param {import('node:child_process').ChildProcess} child
+ * @returns {ProcessIdentity|null}
+ */
+export function captureSpawnIdentity(child) {
+  const identity = process.platform === 'linux' ? linuxProcessIdentity(child.pid || 0) : null;
+  childIdentities.set(child, identity);
+  return identity;
+}
+
+/** @param {ProcessIdentity|null} actual @param {ProcessIdentity|null} expected */
+function sameLinuxIdentity(actual, expected) {
+  if (actual?.platform !== 'linux' || expected?.platform !== 'linux' ||
+      !expected.bootId || !/^[0-9]+$/.test(expected.startTimeTicks || '')) return null;
+  return actual.bootId === expected.bootId && actual.startTimeTicks === expected.startTimeTicks;
+}
 
 /**
  * SEC-002 + Finding 1 (HIGH): child processes must never inherit the
@@ -136,6 +177,7 @@ export function sanitizedSessionEnv(extra = null) {
  * @property {import('node:child_process').ChildProcess} child
  * @property {number} pid
  * @property {string} started_at
+ * @property {ProcessIdentity|null} [processIdentity] exact spawn-time kernel identity
  * @property {Array<Buffer>} stdoutChunks
  * @property {Array<Buffer>} stderrChunks
  * @property {number} stdoutBytes
@@ -143,6 +185,7 @@ export function sanitizedSessionEnv(extra = null) {
  * @property {number} stdoutDroppedBytes bytes discarded past the stream cap
  * @property {number} stderrDroppedBytes bytes discarded past the stream cap
  * @property {boolean} exited
+ * @property {boolean} [detached] POSIX detached group leader (A5: group watchdog keeps running after leader exit)
  * @property {number|null} exitCode
  * @property {unknown} exitSignal
  * @property {number} lastActivityMs
@@ -347,7 +390,7 @@ export function getTombstone(id) {
  * or any failure → null (unknown, never guessed).
  * @param {number} pid
  * @param {{execFile?: any}} [options] injectable for deterministic tests
- * @returns {Promise<{startTimeMs: number, path: string|null, commandLine: string|null}|null>}
+ * @returns {Promise<{startTimeMs: number, creationIdentity: string, path: string|null, commandLine: string|null}|null>}
  */
 export async function queryWindowsProcessIdentity(pid, { execFile = null } = {}) {
   const safePid = Math.floor(Number(pid));
@@ -374,6 +417,7 @@ export async function queryWindowsProcessIdentity(pid, { execFile = null } = {})
     if (!Number.isFinite(startTimeMs)) return null;
     return {
       startTimeMs,
+      creationIdentity: String(row.StartTime),
       path: typeof row?.Path === 'string' && row.Path ? row.Path : null,
       commandLine:
         typeof row?.CommandLine === 'string' && row.CommandLine ? row.CommandLine : null
@@ -394,16 +438,14 @@ export function windowsPathEquals(actual, expected) {
 }
 /**
  * Multi-attribute Windows process identity (Finding 2, MEDIUM).
- * Windows reuses PIDs fast enough that a start time inside the tolerance
- * window can collide with an unrelated recycled process, so time alone can
- * misidentify — a signal/terminate would hit the wrong process. The gate
- * is therefore time AND path AND command-line (each only when an
- * expectation is supplied; path and/or command-line per the reference).
+ * Require the exact, unrounded creation identity captured at spawn by a
+ * trusted native companion. Wall-clock started_at, path and command-line
+ * are not a replacement for that identity, even for the same executable.
  *
  * Fail-closed contract (destructive callers MUST `=== true` before
  * signalling; anything else means "do not touch"):
  * - query failed / process gone / time unparseable → null (unknown);
- * - time outside tolerance → false (different process);
+ * - creation identity mismatch → false (different process);
  * - an expected attribute supplied but the live attribute is missing →
  *   null (cannot positively identify — never signal what you cannot see);
  * - expected attribute present and mismatched → false (positively NOT ours).
@@ -411,23 +453,20 @@ export function windowsPathEquals(actual, expected) {
  * identified-as-other, null = unknown — they may display null as "unknown"
  * but must never upgrade it to an identity.
  * @param {number} pid
- * @param {{startedAtIso?: unknown, path?: unknown, commandLine?: unknown}} [expected]
+ * @param {{startedAtIso?: unknown, creationIdentity?: unknown, path?: unknown, commandLine?: unknown}} [expected]
  * @param {{execFile?: any}} [options] injectable for deterministic tests
  * @returns {Promise<boolean|null>}
  */
 export async function verifyWindowsProcessIdentity(
   pid,
-  { startedAtIso = null, path = null, commandLine = null } = {},
+  { creationIdentity = null, path = null, commandLine = null } = {},
   { execFile = null } = {}
 ) {
-  const expected = Date.parse(String(startedAtIso || ''));
-  if (!Number.isFinite(expected)) return null;
+  if (typeof creationIdentity !== 'string' || !creationIdentity ||
+      !Number.isFinite(Date.parse(creationIdentity))) return null;
   const ident = await queryWindowsProcessIdentity(pid, { execFile });
   if (!ident) return null;
-  // The existing tolerance stays: it is what the time check is good at
-  // (clock skew / ISO rounding); the attributes below are ADDED, not a
-  // replacement.
-  if (Math.abs(ident.startTimeMs - expected) > SWEEP_VERIFY_TOLERANCE_MS) return false;
+  if (ident.creationIdentity !== creationIdentity) return false;
   if (path !== null && path !== undefined && String(path) !== '') {
     if (!ident.path) return null;
     if (!windowsPathEquals(ident.path, String(path))) return false;
@@ -451,65 +490,31 @@ export async function verifyWindowsProcessIdentity(
   return true;
 }
 /**
- * Process start-time check against a record (PID-reuse guard for the boot
- * sweep). Linux reads /proc directly (unchanged — stronger already; the
- * new expected* options are accepted but unused there); Windows now gates
- * on time AND path/command-line via verifyWindowsProcessIdentity; others
- * parse `ps -o lstart` with a tolerance window; unparseable → null
- * (caller skips, never kills blind).
+ * Exact spawn-time identity check. Legacy wall-clock-only records and
+ * platforms without an exact identity source are unverifiable (no signal).
  * @param {number} pid
  * @param {string} startedAtIso
- * @param {{platform?: string, execFile?: any, expectedPath?: unknown, expectedCommandLine?: unknown}} [options]
+ * @param {{platform?: string, execFile?: any, expectedPath?: unknown, expectedCommandLine?: unknown, expectedIdentity?: ProcessIdentity|null}} [options]
  */
 export async function verifyProcessStartTime(
   pid,
   startedAtIso,
-  { platform = process.platform, execFile = null, expectedPath = null, expectedCommandLine = null } = {}
+  { platform = process.platform, execFile = null, expectedPath = null, expectedCommandLine = null, expectedIdentity = null } = {}
 ) {
-  const expected = Date.parse(String(startedAtIso || ''));
-  if (!Number.isFinite(expected)) return null;
+  void startedAtIso; // Kept for existing callers; never used as process identity.
+  if (!expectedIdentity || expectedIdentity.platform !== platform) return null;
   try {
     if (platform === 'linux') {
-      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
-      const afterComm = stat
-        .slice(stat.lastIndexOf(')') + 1)
-        .trim()
-        .split(/\s+/);
-      // field 22 (1-based) after comm = starttime in clock ticks.
-      const ticks = Number(afterComm[19]);
-      if (!Number.isFinite(ticks)) return null;
-      const btime = Number(
-        fs
-          .readFileSync('/proc/stat', 'utf8')
-          .split('\n')
-          .find((l) => l.startsWith('btime'))
-          ?.split(/\s+/)[1]
-      );
-      const ticksPerSec = 100;
-      if (!Number.isFinite(btime)) return null;
-      const actualMs = (btime + ticks / ticksPerSec) * 1000;
-      return Math.abs(actualMs - expected) <= SWEEP_VERIFY_TOLERANCE_MS;
+      return sameLinuxIdentity(linuxProcessIdentity(pid), expectedIdentity);
     }
-    if (platform === 'win32') {
-      // Multi-attribute identity (Finding 2): never time-only on Windows.
-      // Without recorded expectations this is the legacy time check over
-      // the bounded single-PID query; sweepOrphanedSessions additionally
-      // refuses to kill when no expectation was recorded (fail closed).
+    if (platform === 'win32' && expectedIdentity.platform === 'win32') {
       return await verifyWindowsProcessIdentity(
         pid,
-        { startedAtIso, path: expectedPath, commandLine: expectedCommandLine },
+        { creationIdentity: expectedIdentity.creationIdentity, path: expectedPath, commandLine: expectedCommandLine },
         { execFile }
       );
     }
-    const { execFile: ef } = execFile || (await import('node:child_process'));
-    const { promisify } = await import('node:util');
-    const run = promisify(ef);
-    const { stdout } = await run('ps', ['-o', 'lstart=', '-p', String(pid)], {
-      timeout: 10000
-    });
-    const actualMs = Date.parse(String(stdout || '').trim());
-    if (!Number.isFinite(actualMs)) return null;
-    return Math.abs(actualMs - expected) <= SWEEP_VERIFY_TOLERANCE_MS;
+    return null;
   } catch {
     return null;
   }
@@ -517,8 +522,8 @@ export async function verifyProcessStartTime(
 
 /**
  * Boot sweep (SYN-PROC-004): adopt-or-kill processes recorded by a previous
- * agent incarnation. Only kills pids that are BOTH alive AND start-time
- * verified (PID-reuse guard); dead records are dropped; unverifiable records
+ * agent incarnation. Only kills pids that are BOTH alive AND exact-identity
+ * verified (PID-reuse guard); dead records are dropped; legacy/unverifiable records
  * are left for the next boot with action `skipped-unverifiable`.
  * On Windows the bar is higher (Finding 2): a record without a recorded
  * entrypoint is NEVER killed on time-only match (fail closed — a recycled
@@ -532,7 +537,7 @@ export async function sweepOrphanedSessions({ stateDir = null, platform = proces
   const out = [];
   if (!stateDir) return out;
   const file = path.join(stateDir, 'process-sessions.json');
-  /** @type {Record<string, {pid?: unknown, started_at?: unknown, executable?: unknown, args?: unknown}>} */
+  /** @type {Record<string, {pid?: unknown, started_at?: unknown, executable?: unknown, args?: unknown, processIdentity?: ProcessIdentity|null}>} */
   let all = {};
   try {
     const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -562,6 +567,7 @@ export async function sweepOrphanedSessions({ stateDir = null, platform = proces
         platform,
         execFile,
         expectedPath,
+        expectedIdentity: rec.processIdentity || null,
         expectedCommandLine: expectedArgs && expectedArgs.length > 0 ? expectedArgs : null
       });
     } catch {
@@ -583,6 +589,7 @@ export async function sweepOrphanedSessions({ stateDir = null, platform = proces
         force: false,
         graceMs: SWEEP_KILL_GRACE_MS,
         expectedStartedAt: String(rec?.started_at || ''),
+        expectedIdentity: rec.processIdentity || null,
         expectedPath,
         expectedCommandLine: expectedArgs && expectedArgs.length > 0 ? expectedArgs : null,
         execFile
@@ -596,6 +603,7 @@ export async function sweepOrphanedSessions({ stateDir = null, platform = proces
           force: true,
           graceMs: 0,
           expectedStartedAt: String(rec?.started_at || ''),
+          expectedIdentity: rec.processIdentity || null,
           expectedPath,
           expectedCommandLine: expectedArgs && expectedArgs.length > 0 ? expectedArgs : null,
           execFile
@@ -660,14 +668,38 @@ export function startSession(
   args,
   { cwd, env, timeoutMs = 300000, idleTtlMs = DEFAULT_IDLE_TTL_MS } = {}
 ) {
-  const resolved = resolveExecutable(executable, env);
+  let resolved = resolveExecutable(executable, env);
+  const childEnv = sanitizedSessionEnv(env);
+  if (process.platform === 'win32') {
+    // Record and spawn the same full image path; a PATH token cannot equal
+    // Win32_Process.ExecutablePath and must never become basename-only trust.
+    const pathKey = Object.keys(childEnv).sort().find((key) => key.toLowerCase() === 'path');
+    const dirs = /[\\/]/.test(resolved)
+      ? ['']
+      : [cwd || process.cwd(), ...String(pathKey ? childEnv[pathKey] : '').split(';').filter(Boolean)];
+    for (const dir of dirs) {
+      const base = path.win32.resolve(cwd || process.cwd(), dir.replace(/^"(.*)"$/, '$1'), resolved);
+      const candidates = path.win32.extname(base) ? [base] : [`${base}.com`, `${base}.exe`];
+      const found = candidates.find((candidate) => {
+        try { return fs.existsSync(candidate); } catch { return false; }
+      });
+      if (found) {
+        resolved = found;
+        break;
+      }
+    }
+  }
   const child = spawn(resolved, args, {
     cwd,
-    env: sanitizedSessionEnv(env),
+    env: childEnv,
     stdio: ['pipe', 'pipe', 'pipe'],
     detached: process.platform !== 'win32',
     windowsHide: true
   });
+  // Linux records exact start ticks before yielding to the event loop.
+  // Windows/macOS need a retained native handle/creation identity. Until a
+  // trusted spawn companion supplies it, fail closed rather than guess.
+  const processIdentity = captureSpawnIdentity(child);
   // A8-b: deprioritize the heavy child right after spawn (best-effort,
   // never throws; win32 honestly skips — see shedChildPriority).
   try {
@@ -687,6 +719,7 @@ export function startSession(
     pid: child.pid || 0,
     detached: process.platform !== 'win32',
     started_at: new Date(now).toISOString(),
+    processIdentity,
     executable: resolved,
     args: [...args],
     stdoutChunks: [],
@@ -742,7 +775,10 @@ export function startSession(
     session.lastActivityMs = Date.now();
     session.emitter?.emit('output');
   });
-  child.once('error', () => {
+  child.on('error', () => {
+    // A spawned child's signal/send error is not an exit. Only failure to
+    // obtain a PID is terminal here; successful spawns have an exit event.
+    if (session.pid > 0) return;
     session.exited = true;
     session.lastActivityMs = Date.now();
     if (session.killTimer) {
@@ -815,8 +851,8 @@ export function readSession(session, stdoutCursor, stderrCursor, maxBytes) {
   return {
     stdout: stdout.toString('utf8'),
     stderr: stderr.toString('utf8'),
-    stdout_cursor: out.length,
-    stderr_cursor: err.length,
+    stdout_cursor: Math.min(stdoutCursor, out.length) + stdout.length,
+    stderr_cursor: Math.min(stderrCursor, err.length) + stderr.length,
     stdout_truncated: session.stdoutDroppedBytes > 0 || stdoutCut,
     stdout_dropped_bytes: session.stdoutDroppedBytes,
     stderr_truncated: session.stderrDroppedBytes > 0 || stderrCut,
@@ -834,7 +870,7 @@ export function writeSession(session, data) {
   if (session.exited) return { ok: false, error: 'PROCESS_EXITED' };
   if (!session.child.stdin || session.child.stdin.destroyed)
     return { ok: false, error: 'PROCESS_STDIN_CLOSED' };
-  if (Buffer.byteLength(data, 'utf8') > MAX_INPUT_BYTES)
+  if (Buffer.byteLength(data, 'utf8') + (session.child.stdin.writableLength || 0) > MAX_INPUT_BYTES)
     return { ok: false, error: 'INPUT_TOO_LARGE' };
   session.child.stdin.write(data);
   session.lastActivityMs = Date.now();
@@ -842,30 +878,48 @@ export function writeSession(session, data) {
 }
 
 /**
+ * Synchronous tree kill (R-C1: deprecated — prefer terminateSessionTreeAsync).
+ * Requires the spawn-time identity and verifies it synchronously (linux
+ * /proc only; every other platform fails closed because a sync check
+ * cannot query WMI/ps). A missing, unparseable, mismatched or
+ * unverifiable identity sends NO signal (fail closed, `skipped-unverified`).
  * @param {import('node:child_process').ChildProcess|undefined|null} child
  * @param {string} [platform]
  * @param {boolean} [force]
+ * @param {{expectedStartedAt?: unknown, expectedPath?: unknown, expectedCommandLine?: unknown, expectedIdentity?: ProcessIdentity|null}} [options] spawn-time identity (REQUIRED)
  */
-export function terminateSessionTree(child, platform = process.platform, force = false) {
-  if (!child?.pid) return;
+export function terminateSessionTree(child, platform = process.platform, force = false, options = {}) {
+  const pid = Math.floor(Number(child?.pid));
+  if (!Number.isInteger(pid) || pid < 2)
+    return { signaled: false, signal: null, graceful: false };
+  const { expectedStartedAt = null } = options || {};
+  const expectedMs = Date.parse(String(expectedStartedAt || ''));
+  if (!Number.isFinite(expectedMs))
+    return { signaled: false, signal: null, graceful: false, escalation: 'skipped-unverified' };
+  let verdict = null;
+  try {
+    if (platform === 'linux')
+      verdict = sameLinuxIdentity(linuxProcessIdentity(pid), options.expectedIdentity || childIdentities.get(child) || null);
+  } catch {
+    verdict = null;
+  }
+  if (verdict !== true)
+    return { signaled: false, signal: null, graceful: false, escalation: 'skipped-unverified' };
   if (platform === 'win32') {
-    // argv-form taskkill (no cmd.exe string): tree kill, forced. Graceful
-    // escalation lives in terminateSessionTreeAsync below.
-    try {
-      spawn('taskkill', ['/PID', String(Math.floor(Number(child.pid))), '/T', '/F'], {
-        stdio: 'ignore',
-        windowsHide: true
-      }).unref();
-    } catch {}
-    return;
+    // Unreachable today (non-linux always fails closed above); kept as
+    // defense in depth so a future sync verifier cannot silently widen.
+    return { signaled: false, signal: null, graceful: false, escalation: 'skipped-unverified' };
   }
   try {
-    process.kill(-child.pid, force ? 'SIGKILL' : 'SIGTERM');
+    process.kill(-pid, force ? 'SIGKILL' : 'SIGTERM');
   } catch {
     try {
       child.kill(force ? 'SIGKILL' : 'SIGTERM');
-    } catch {}
+    } catch {
+      return { signaled: false, signal: null, graceful: false };
+    }
   }
+  return { signaled: true, signal: force ? 'SIGKILL' : 'SIGTERM', graceful: !force };
 }
 
 /**
@@ -877,8 +931,9 @@ function isPidAlive(pid, platform = process.platform) {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (e) {
+    // Only ESRCH proves absence; permission/probe failures are not death.
+    return /** @type {NodeJS.ErrnoException} */ (e)?.code !== 'ESRCH';
   }
 }
 
@@ -896,51 +951,22 @@ export function isGroupAlive(pid) {
   }
 }
 
+/**
+ * @param {number|undefined|null} pid group-leader pid
+ * @param {string|number} [startedAtIso] expected start time
+ * @param {{platform?: string, execFile?: any, expectedIdentity?: ProcessIdentity|null}} [options]
+ * @returns {Promise<boolean|null>}
+ */
 export async function verifyPgidIdentity(
   pid,
   startedAtIso,
-  { platform = process.platform, execFile = null } = {}
+  { platform = process.platform, execFile = null, expectedIdentity = null } = {}
 ) {
   const id = Math.floor(Number(pid));
   if (!Number.isInteger(id) || id < 2) return false;
-  const leaderVerdict = await verifyProcessStartTime(id, startedAtIso, { platform, execFile });
-  if (leaderVerdict === true) return true;
-  if (leaderVerdict === false) return false;
-  if (platform === 'linux') {
-    try {
-      const expected = Date.parse(String(startedAtIso || ''));
-      if (!Number.isFinite(expected)) return false;
-      const btime = Number(
-        fs
-          .readFileSync('/proc/stat', 'utf8')
-          .split('\n')
-          .find((l) => l.startsWith('btime'))
-          ?.split(/\s+/)[1]
-      );
-      if (!Number.isFinite(btime)) return false;
-      const ticksPerSec = 100;
-      const pids = fs.readdirSync('/proc').filter((p) => /^\d+$/.test(p));
-      for (const p of pids) {
-        try {
-          const s = fs.readFileSync(`/proc/${p}/stat`, 'utf8');
-          const afterComm = s.slice(s.lastIndexOf(')') + 1).trim().split(/\s+/);
-          const pgrp = Number(afterComm[2]);
-          if (pgrp === id) {
-            const ticks = Number(afterComm[19]);
-            if (Number.isFinite(ticks)) {
-              const actualMs = (btime + ticks / ticksPerSec) * 1000;
-              if (Math.abs(actualMs - expected) <= SWEEP_VERIFY_TOLERANCE_MS) {
-                return true;
-              }
-            }
-          }
-        } catch {}
-      }
-    } catch {
-      return false;
-    }
-  }
-  return false;
+  // A surviving group member's recent birth is not the leader's identity.
+  // Without the original leader, group ownership cannot be established.
+  return await verifyProcessStartTime(id, String(startedAtIso), { platform, execFile, expectedIdentity });
 }
 
 /**
@@ -949,7 +975,7 @@ export async function verifyPgidIdentity(
  * the process actually died so callers (and models) can tell signaled apart
  * from killed.
  * @param {import('node:child_process').ChildProcess|{pid?: unknown, kill?: unknown}|undefined|null} child
- * @param {{platform?: string, force?: boolean, graceMs?: number, expectedStartedAt?: string|null, expectedPath?: string|null, expectedCommandLine?: unknown, execFile?: any}} [options]
+ * @param {{platform?: string, force?: boolean, graceMs?: number, expectedStartedAt?: string|null, expectedPath?: string|null, expectedCommandLine?: unknown, expectedIdentity?: ProcessIdentity|null, execFile?: any}} [options]
  */
 export async function terminateSessionTreeAsync(
   child,
@@ -960,19 +986,22 @@ export async function terminateSessionTreeAsync(
     expectedStartedAt = null,
     expectedPath = null,
     expectedCommandLine = null,
+    expectedIdentity = child ? childIdentities.get(child) || null : null,
     execFile = null
   } = {}
 ) {
   const pid = Math.floor(Number(child?.pid));
   if (!Number.isInteger(pid) || pid < 2) return { signaled: false, signal: null, graceful: false };
-  // P2-05/05b: verify-first PID-reuse guard. When the caller supplied an
-  // expected start time, verify BEFORE any signal: a recycled PID must
-  // never receive even a gentle signal. Fail closed (no signal) on
-  // false/mismatch or null/unknown. Callers without identity (null) keep
-  // legacy behaviour; all timeout sites below always supply identity.
+  // R-C1: verify-first PID-reuse guard, FAIL CLOSED. The spawn-time
+  // identity is REQUIRED in addition to started_at. A wall-clock timestamp
+  // never authorizes a signal; use the captured child identity or an exact
+  // persisted identity (a recycled PID must not receive even a gentle signal).
   // Residual: an unverifiable PID is left running rather than risk
   // signalling an unrelated recycled process/group.
-  if (expectedStartedAt != null) {
+  {
+    const expectedMs = Date.parse(String(expectedStartedAt || ''));
+    if (!Number.isFinite(expectedMs))
+      return { signaled: false, signal: null, graceful: false, escalation: 'skipped-unverified' };
     let pre = null;
     try {
       if (isPidAlive(pid, platform)) {
@@ -980,11 +1009,13 @@ export async function terminateSessionTreeAsync(
           platform,
           execFile,
           expectedPath,
+          expectedIdentity,
           expectedCommandLine
         });
       } else if (platform !== 'win32' && isGroupAlive(pid)) {
         pre = await verifyPgidIdentity(pid, String(expectedStartedAt), {
-          platform,
+          platform: /** @type {string} */ (platform),
+          expectedIdentity,
           execFile
         });
       }
@@ -1025,6 +1056,7 @@ export async function terminateSessionTreeAsync(
             platform,
             execFile,
             expectedPath,
+            expectedIdentity,
             expectedCommandLine
           });
         } catch {
@@ -1083,11 +1115,13 @@ export async function terminateSessionTreeAsync(
             platform,
             execFile,
             expectedPath,
+            expectedIdentity,
             expectedCommandLine
           });
         } else if (platform !== 'win32' && isGroupAlive(pid)) {
           verdict = await verifyPgidIdentity(pid, String(expectedStartedAt), {
-            platform,
+            platform: /** @type {string} */ (platform),
+            expectedIdentity,
             execFile
           });
         }
@@ -1119,7 +1153,7 @@ export async function terminateSessionTreeAsync(
  * spawned child so a refusal never leaks an orphan process).
  * @param {string} id
  * @param {ProcessSession} session
- * @param {string|null} [stateDir] when given, persist {pid,started_at} for boot sweep
+ * @param {string|null} [stateDir] persist pid, wall-clock metadata and exact identity for boot sweep
  */
 export function trackSession(id, session, stateDir = null) {
   reapSessions();
@@ -1137,8 +1171,8 @@ export function trackSession(id, session, stateDir = null) {
       // Finding 2: persist the entrypoint alongside pid/started_at so a
       // later boot sweep can check path + CommandLine, not just time.
       // Bounded: argv capped at 64 entries by process_start validation.
-      /** @type {{pid?: unknown, started_at?: unknown, executable?: unknown, args?: unknown}} */
-      const rec = { pid: session.pid, started_at: session.started_at };
+      /** @type {{pid?: unknown, started_at?: unknown, executable?: unknown, args?: unknown, processIdentity?: ProcessIdentity|null}} */
+      const rec = { pid: session.pid, started_at: session.started_at, processIdentity: session.processIdentity || null };
       if (typeof session.executable === 'string' && session.executable) rec.executable = session.executable;
       if (Array.isArray(session.args) && session.args.length > 0)
         rec.args = session.args.map(String).slice(0, 64);
@@ -1490,7 +1524,14 @@ export function makeProcessHandlers(
         });
         if (!trackSession(processId, session, stateDir)) {
           try {
-            terminateSessionTree(session.child, process.platform, true);
+            await terminateSessionTreeAsync(session.child, {
+              platform: process.platform,
+              force: true,
+              graceMs: 0,
+              expectedStartedAt: session.started_at,
+              expectedPath: session.executable,
+              expectedCommandLine: session.args
+            });
           } catch {}
           throw new Error('PROCESS_TABLE_FULL');
         }
@@ -1634,25 +1675,34 @@ export function makeProcessHandlers(
           expectedPath: typeof session.executable === 'string' ? session.executable : null,
           expectedCommandLine: Array.isArray(session.args) ? session.args.map(String) : null
         });
-        session.exited = true;
-        session.lastActivityMs = Date.now();
-        retireSession(
-          id,
-          {
-            signal: outcome.signal,
-            graceful: outcome.graceful,
-            forced: p.force === true,
-            ...(typeof outcome.escalation === 'string' && outcome.escalation
-              ? { escalation: outcome.escalation }
-              : {})
-          },
-          stateDir
+        const groupAlive = session.detached && process.platform !== 'win32' && isGroupAlive(session.pid);
+        const terminated = !groupAlive && (
+          session.exited ||
+          (outcome.signaled === true && !outcome.escalation && !isPidAlive(session.pid))
         );
+        // A skipped/failed signal is not a terminated process. Keep its live
+        // handle, watchdog and transcript so a later authorized stop can retry.
+        if (terminated) {
+          session.exited = true;
+          session.lastActivityMs = Date.now();
+          retireSession(
+            id,
+            {
+              signal: outcome.signal,
+              graceful: outcome.graceful,
+              forced: p.force === true,
+              ...(typeof outcome.escalation === 'string' && outcome.escalation
+                ? { escalation: outcome.escalation }
+                : {})
+            },
+            stateDir
+          );
+        }
         // P2-06: surface the verify-first escalation so callers see
         // 'skipped-unverified' instead of a silent graceful:false.
         return ok({
           process_id: id,
-          terminated: true,
+          terminated,
           forced: p.force === true,
           signal: outcome.signal,
           graceful: outcome.graceful,

@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
+import { captureSpawnIdentity, terminateSessionTreeAsync } from '../process/process-sessions.mjs';
 import { ncLayout } from '../client/nc-paths.mjs';
 import { releaseHeldLock } from '../client/singleton.mjs';
 // Shared safe tar extractor (also used for npm-fetched browser payloads).
@@ -20,6 +21,7 @@ export const REQUIRED_UPDATE_FILES = [
   'browser-runtime.mjs',
   'egress-policy.mjs',
   'client.mjs',
+  'operation-log.mjs',
   'ws-transport.mjs',
   'agent-state.mjs',
   'shell-runner.mjs',
@@ -133,7 +135,7 @@ export function compareAgentVersions(a, b) {
   return pre(a) - pre(b);
 }
 /**
- * @param {string | Buffer} b
+ * @param {string | Uint8Array} b
  */
 const sha256 = (b) => crypto.createHash('sha256').update(b).digest('hex');
 /**
@@ -156,6 +158,7 @@ const exists = async (p) => {
 const run = (cmd, args, cwd, timeoutMs = 60000) =>
   new Promise((resolve, reject) => {
     let p;
+    const startedAt = new Date().toISOString();
     try {
       p = spawn(cmd, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     } catch (e) {
@@ -165,11 +168,18 @@ const run = (cmd, args, cwd, timeoutMs = 60000) =>
     let out = '',
       err = '';
     let settled = false;
-    const timer = setTimeout(() => {
+    const timer = setTimeout(async () => {
       if (settled) return;
       settled = true;
       try {
-        p.kill('SIGKILL');
+        await terminateSessionTreeAsync(p, {
+          platform: process.platform,
+          force: true,
+          graceMs: 0,
+          expectedStartedAt: startedAt,
+          expectedPath: cmd,
+          expectedCommandLine: args
+        });
       } catch {}
       try {
         p.stdout?.destroy();
@@ -447,11 +457,99 @@ export function livePid(pid) {
   }
 }
 
-function launchVisible(file, args) {
+// R-C3: tolerance for the start-time identity check below. A same-PID
+// process that started more than this from the recorded launch is never
+// treated as ours (PID reuse on Windows is fast).
+const LAUNCH_VERIFY_TOLERANCE_MS = 120 * 1000;
+
+/**
+ * Bounded single-PID Windows identity query (R-C3). Get-CimInstance
+ * with a ProcessId filter addresses ONE instance — no WMI enumeration.
+ * Sync (spawnSync) so the queue loop needs no restructuring. Empty/missing
+ * output or any failure → null (unknown, never guessed).
+ * @param {unknown} pid
+ */
+export function queryProcessIdentitySync(pid) {
+  const id = Math.floor(Number(pid));
+  if (!Number.isInteger(id) || id < 2 || id > 4194304) return null;
+  try {
+    // No backticks or dollar-brace sequences in this file: it stays
+    // embeddable byte-identical inside the OTA updater String.raw
+    // template (see isSafeBrowserTarget).
+    const r = runHidden(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-WindowStyle',
+        'Hidden',
+        '-Command',
+        '$p = Get-CimInstance Win32_Process -Filter \'ProcessId = ' +
+          id +
+          '\'; ' +
+          'if ($p) { [pscustomobject]@{ StartTime = $p.CreationDate.ToUniversalTime().ToString(\'o\'); ' +
+          'Path = $p.ExecutablePath } | ConvertTo-Json -Compress }'
+      ],
+      10000
+    );
+    const text = String(r.stdout || '').trim();
+    if (!text || text === 'null') return null;
+    const row = JSON.parse(text);
+    const startTimeMs = Date.parse(String(row?.StartTime || ''));
+    if (!Number.isFinite(startTimeMs)) return null;
+    return {
+      startTimeMs,
+      path: typeof row?.Path === 'string' && row.Path ? row.Path : null
+    };
+  } catch {
+    return null;
+  }
+}
+/**
+ * Case-insensitive Windows path equality (the Win32 namespace is
+ * case-insensitive).
+ */
+export function windowsPathEquals(actual, expected) {
+  const norm = (v) => String(v || '').replace(/\//g, '\\').toLowerCase();
+  return norm(actual) === norm(expected);
+}
+/**
+ * Verify a close target against its recorded launch descriptor (R-C3:
+ * start-time AND executable path). Tri-state: true = ours, false =
+ * positively someone else's, null = unknown. Destructive callers must
+ * require a strict true before signalling; anything else fails closed.
+ * @param {unknown} pid
+ * @param {{startedAt?: unknown, exec?: unknown}|null|undefined} descriptor
+ * @param {{query?: ((pid: unknown) => {startTimeMs: number, path: string|null}|null)|null}} [options] injectable identity source (tests)
+ */
+export function verifyLaunchDescriptorSync(pid, descriptor, { query = null } = {}) {
+  const expected = Date.parse(String(descriptor?.startedAt || ''));
+  if (!Number.isFinite(expected)) return null;
+  let ident = null;
+  try {
+    ident = typeof query === 'function' ? query(pid) : queryProcessIdentitySync(pid);
+  } catch {
+    ident = null;
+  }
+  if (!ident) return null;
+  if (Math.abs(ident.startTimeMs - expected) > LAUNCH_VERIFY_TOLERANCE_MS) return false;
+  const wantExec = String(descriptor?.exec || '');
+  if (wantExec) {
+    if (!ident.path) return null;
+    if (!windowsPathEquals(ident.path, wantExec)) return false;
+  }
+  return true;
+}
+
+async function launchVisible(file, args) {
   // GUI apps launch visibly (product behavior); no console of our own.
   const child = spawn(file, args, { detached: true, stdio: 'ignore', windowsHide: false });
-  child.unref();
-  return child.pid;
+  return new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('spawn', () => {
+      child.unref();
+      resolve(child.pid);
+    });
+  });
 }
 
 export function isSafeBrowserTarget(target) {
@@ -657,12 +755,42 @@ export async function runBroker({ root = brokerRoot(), maxBeats = null } = {}) {
     // Stale-lock takeover: a crashed broker leaves the file behind (same
     // flaw the .ps1 broker had, minus the mystery — PID is recorded now).
     try {
-      const owner = Number(String(fs.readFileSync(lockPath, 'utf8')).trim());
+      const rawBefore = String(fs.readFileSync(lockPath, 'utf8'));
+      const owner = Number(rawBefore.trim());
       if (!livePid(owner)) {
+        // L01b-8 (cont.): re-read before removing — a changed file is a
+        // competitor's fresh lock and must never be collateral-deleted.
+        let fresh = false;
         try {
-          fs.rmSync(lockPath, { force: true });
-        } catch {}
-        lockFd = claimLock();
+          fresh = String(fs.readFileSync(lockPath, 'utf8')) !== rawBefore;
+        } catch {
+          fresh = true;
+        }
+        if (fresh) {
+          lockFd = null;
+        } else {
+          try {
+            fs.rmSync(lockPath, { force: true });
+          } catch {}
+          lockFd = claimLock();
+        }
+        // L01b-8: re-validate the claim outcome — a competitor may have
+        // won the file between our rm and our create. Only a lock whose
+        // read-back PID is ours counts as owned.
+        if (lockFd !== null) {
+          let mine = false;
+          try {
+            mine = Number(String(fs.readFileSync(lockPath, 'utf8')).trim()) === process.pid;
+          } catch {
+            mine = false;
+          }
+          if (!mine) {
+            try {
+              fs.closeSync(lockFd);
+            } catch {}
+            lockFd = null;
+          }
+        }
       }
     } catch {}
     if (lockFd === null) return 'already-running';
@@ -678,6 +806,11 @@ export async function runBroker({ root = brokerRoot(), maxBeats = null } = {}) {
   process.once('exit', releaseLock);
   blog('ready session=' + sessionId);
   const max = maxBeats ?? (Number(process.env.NC_BROKER_MAX_BEATS) || Infinity);
+  // R-C3: pid -> {startedAt, exec} for every GUI app this broker
+  // incarnation launched. Close verifies the live process against it
+  // before signalling; a restart wipes the map, in which case the
+  // request-carried descriptor (startedAt/exec from gui_launch) is used.
+  const launched = new Map();
   let beats = 0;
   try {
     for (;;) {
@@ -734,6 +867,22 @@ export async function runBroker({ root = brokerRoot(), maxBeats = null } = {}) {
             const cpid = Number(q.pid) || 0;
             if (cpid <= 0) throw new Error('GUI_PID_REQUIRED');
             if (!processInSession(cpid, sessionId)) throw new Error('GUI_PID_FOREIGN_SESSION');
+            // R-C3: verify start-time/exec against the recorded launch
+            // descriptor (broker memory, else the request-carried copy)
+            // BEFORE any signal. Missing, mismatched or unverifiable
+            // identity fails closed: no kill, GUI_CLOSE_FAILED.
+            const recorded = launched.get(cpid) || null;
+            const descriptor =
+              recorded ||
+              (q.startedAt || q.exec ? { startedAt: q.startedAt, exec: q.exec } : null);
+            let verdict = null;
+            try {
+              verdict = descriptor ? verifyLaunchDescriptorSync(cpid, descriptor) : null;
+            } catch {
+              verdict = null;
+            }
+            if (verdict !== true) throw new Error('GUI_CLOSE_FAILED');
+            launched.delete(cpid);
             let killed = false;
             try {
               process.kill(cpid);
@@ -759,15 +908,20 @@ export async function runBroker({ root = brokerRoot(), maxBeats = null } = {}) {
                 throw new Error('GUI_URL_SCHEME_NOT_ALLOWED');
             }
             const spec = resolveAppTarget(app, tgt || undefined);
-            const pid = launchVisible(spec.file, spec.args);
+            const launchStartedAt = new Date().toISOString();
+            const pid = await launchVisible(spec.file, spec.args);
             await sleep(800);
             let realPid = pid;
             try {
               if (!livePid(pid)) realPid = correlatePid(pid, sessionId);
             } catch {}
+            // R-C3: record the launch descriptor for the verified close.
+            if (Number.isInteger(realPid) && realPid > 0)
+              launched.set(realPid, { startedAt: launchStartedAt, exec: spec.file });
             r.ok = true;
             r.error = null;
             r.pid = realPid;
+            r.exec = spec.file;
           }
         } catch (e) {
           r.error = e instanceof Error ? e.message : String(e);
@@ -808,6 +962,84 @@ if (isMain) {
 `;
 
 /**
+ * Pinned offline release public key (Ed25519 SPKI PEM) for OTA update package verification.
+ * May be overridden via NC_RELEASE_PUBLIC_KEY for testing / offline key rotation.
+ *
+ * 2026-10-15 rotation (orphaned pin incident): the previous pin had no
+ * private counterpart anywhere (repo, VPS, vault), so every signed release
+ * failed closed with UPDATE_SIGNATURE_INVALID and fleet rollout halted.
+ * This pin is the public half of the production signing key at
+ * /opt/nc-workspace/vault/hhc-release-signing.key.
+ */
+export const DEFAULT_RELEASE_PUBLIC_KEY = `-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEA12U1SLr9z5mMxynd/R/r/O9yuWGXLFVPJc3BI+wyzrQ=
+-----END PUBLIC KEY-----`;
+
+/**
+ * Verify release package signature using Ed25519 pinned public key.
+ * Field coordinated with F5 ('signature' / 'ed25519').
+ * Accepts three canonical payload shapes, all verified against a 64-byte
+ * Ed25519 signature with a pinned ed25519 key (L06-7: any other key type
+ * fails closed — an RSA/EC key for an Ed25519 slot is a key-confusion
+ * attack, not a rotation):
+ * 1. raw archive bytes (legacy); 2. UTF-8 hex SHA-256 digest of the body;
+ * 3. the canonical OTA payload `${version}:${sha256}` when
+ *    `options.version` is supplied (control-plane signReleasePayload
+ *    shape; R-C6 alignment).
+ * Encodings are strict (L06-7: ambiguous encodings rejected — a hex-only
+ * decode for 128-hex strings, pure base64url alphabet when -/_ appear,
+ * pure base64 otherwise; mixed alphabets fail closed).
+ * @param {Buffer|Uint8Array} body
+ * @param {string} signature
+ * @param {{publicKey?: string, expectedSha256?: string, version?: string}} [options]
+ * @returns {boolean}
+ */
+export function verifyReleaseSignature(body, signature, options = {}) {
+  const pem = options.publicKey || process.env.NC_RELEASE_PUBLIC_KEY || DEFAULT_RELEASE_PUBLIC_KEY;
+  if (!signature || typeof signature !== 'string') return false;
+  try {
+    const key = crypto.createPublicKey(pem);
+    // L06-7: pin the algorithm. Without this, a rotated/compromised PEM
+    // carrying an RSA or ECDSA key would verify attacker-chosen signatures
+    // through the same code path (key-type confusion).
+    if (key.asymmetricKeyType !== 'ed25519') return false;
+    const trimmed = signature.trim();
+    if (!trimmed || trimmed.length > 256) return false;
+    /** @type {BufferEncoding} */
+    let encoding;
+    if (/^[0-9a-fA-F]{128}$/.test(trimmed)) {
+      encoding = 'hex';
+    } else if (trimmed.includes('-') || trimmed.includes('_')) {
+      if (!/^[A-Za-z0-9\-_]+={0,2}$/.test(trimmed)) return false;
+      encoding = 'base64url';
+    } else {
+      if (!/^[A-Za-z0-9+/]+={0,2}$/.test(trimmed)) return false;
+      encoding = 'base64';
+    }
+    const sigBuffer = Buffer.from(trimmed, encoding);
+    if (sigBuffer.length !== 64) return false;
+    if (crypto.verify(null, body, key, sigBuffer)) return true;
+    const digest = options.expectedSha256 || sha256(body);
+    if (typeof digest === 'string' && /^[a-f0-9]{64}$/i.test(digest)) {
+      if (crypto.verify(null, Buffer.from(digest, 'utf8'), key, sigBuffer)) return true;
+      // R-C6 canonical payload: `${version}:${sha256}` (what the control
+      // plane signs). Only when the caller supplies the exact version it
+      // already validated — never assembled from the body alone.
+      const version = typeof options.version === 'string' ? options.version : '';
+      if (version && validVersion(version)) {
+        if (
+          crypto.verify(null, Buffer.from(`${version}:${digest.toLowerCase()}`, 'utf8'), key, sigBuffer)
+        )
+          return true;
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * @param {object} options
  * @param {string} options.serverUrl
  * @param {(method: string, url: string, options: Record<string, unknown>) => Promise<Record<string, string>>} options.authHeaders
@@ -828,7 +1060,8 @@ export function makeUpdateHandler(options) {
       ),
       version = String(p.version || ''),
       expected = String(p.sha256 || '').toLowerCase(),
-      packageUrl = String(p.package_url || '');
+      packageUrl = String(p.package_url || ''),
+      rawSignature = p.signature ?? p.ed25519 ?? null;
     if (!validVersion(version))
       return fail('INVALID_UPDATE_VERSION', {
         error_code: 'INVALID_UPDATE_VERSION',
@@ -876,6 +1109,12 @@ export function makeUpdateHandler(options) {
       if (!r.ok) throw new Error(`UPDATE_DOWNLOAD_HTTP_${r.status}`);
       const body = await readCappedResponseBody(r);
       if (sha256(body) !== expected) throw new Error('UPDATE_SHA256_MISMATCH');
+      const signature = p.signature ?? p.ed25519 ?? null;
+      if (
+        !signature ||
+        !verifyReleaseSignature(body, String(signature), { expectedSha256: expected, version })
+      )
+        throw new Error('UPDATE_SIGNATURE_INVALID');
       await fs.writeFile(archive, body, { mode: 0o640 });
       await extractReleaseArchive(body, stage);
       for (const name of REQUIRED)
@@ -940,11 +1179,14 @@ export function makeUpdateHandler(options) {
  * @param {string} source
  * @param {string} destination
  */
-async function moveDirContents(source, destination) {
+async function moveDirContents(source, destination, moved = null) {
   await fs.mkdir(source, { recursive: true });
   await fs.mkdir(destination, { recursive: true });
-  for (const name of await fs.readdir(source))
-    await fs.rename(path.join(source, name), path.join(destination, name));
+  for (const name of await fs.readdir(source)) {
+    const from = path.join(source, name), to = path.join(destination, name);
+    await fs.rename(from, to);
+    moved?.push([from, to]);
+  }
 }
 
 /**
@@ -957,14 +1199,20 @@ export async function swapAppContents(stage, { layout = ncLayout(), previous } =
   if (!previous) throw new Error('UPDATE_BACKUP_PATH_REQUIRED');
   await fs.mkdir(layout.app, { recursive: true });
   await fs.mkdir(previous, { recursive: true });
-  await moveDirContents(layout.app, previous);
+  if ((await fs.readdir(previous)).length) throw new Error('UPDATE_BACKUP_NOT_EMPTY');
+  const moved = [];
   try {
-    await moveDirContents(stage, layout.app);
+    await moveDirContents(layout.app, previous, moved);
+    await moveDirContents(stage, layout.app, moved);
   } catch (error) {
-    try {
-      await moveDirContents(layout.app, stage);
-    } catch {}
-    await moveDirContents(previous, layout.app);
+    const recoveryErrors = [];
+    for (const [from, to] of moved.reverse()) {
+      try { await fs.rename(to, from); } catch (recoveryError) { recoveryErrors.push(recoveryError); }
+    }
+    if (recoveryErrors.length) throw Object.assign(
+      new AggregateError([error, ...recoveryErrors], 'UPDATE_MOVE_RECOVERY_FAILED', { cause: error }),
+      { oldTreeRestored: false }
+    );
     throw error;
   }
 }
@@ -1280,7 +1528,66 @@ export function windowsActivationHelperSource({
   const supervisorMjsWrite = supervisorMjsTemplate
     ? `try{fs.writeFileSync(${v(path.join(layout.root, 'nc-supervisor.mjs'))},${v(supervisorMjsTemplate)})}catch{};`
     : '';
-  return `import fs from 'node:fs';import path from 'node:path';\nconst sleep=ms=>new Promise(r=>setTimeout(r,ms));\nconst app=${v(layout.app)},stage=${v(stage)},previous=${v(previous)},failed=${v(failed)},marker=${v(marker)},lock=${v(lock)},clientLock=${v(layout.lockFile)},pidFile=${v(layout.pidFile)},parentPid=${Number(parentPid)};\nconst alive=pid=>{if(!Number.isInteger(pid)||pid<2)return false;try{process.kill(pid,0);return true}catch{return false}};\nconst move=(a,b)=>{fs.mkdirSync(a,{recursive:true});fs.mkdirSync(b,{recursive:true});for(const n of fs.readdirSync(a))fs.renameSync(path.join(a,n),path.join(b,n))};\nfor(let i=0;i<200&&alive(parentPid);i++)await sleep(100);\nif(alive(parentPid)){fs.rmSync(lock,{force:true});process.exit(3)};fs.rmSync(clientLock,{force:true});\ntry{move(app,previous);move(stage,app);try{fs.rmSync(path.join(app,'nc-agent.exe'),{force:true})}catch{};${supervisorWrite}${supervisorMjsWrite}fs.rmSync(lock,{force:true})}catch(e){try{if(fs.existsSync(previous)){move(app,stage);move(previous,app)}}catch{};fs.rmSync(lock,{force:true});process.exit(2)}\nawait sleep(25000);if(fs.existsSync(marker))process.exit(0);\ntry{fs.writeFileSync(lock,'rollback\\n');let pid=0;try{pid=Number(fs.readFileSync(pidFile,'utf8').trim())}catch{};if(alive(pid))try{process.kill(pid,'SIGTERM')}catch{};for(let i=0;i<100&&alive(pid);i++)await sleep(100);move(app,failed);move(previous,app)}catch{}finally{fs.rmSync(lock,{force:true})}\n`;
+  return `import fs from 'node:fs';
+import path from 'node:path';
+import cp from 'node:child_process';
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const app=${v(layout.app)}, stage=${v(stage)}, previous=${v(previous)}, failed=${v(failed)}, marker=${v(marker)}, lock=${v(lock)}, clientLock=${v(layout.lockFile)}, parentPid=${Number(parentPid)};
+const alive = pid => { if (!Number.isInteger(pid) || pid < 2) return false; try { process.kill(pid, 0); return true; } catch { return false; } };
+const move = (a, b, journal) => {
+  fs.mkdirSync(a, {recursive:true}); fs.mkdirSync(b, {recursive:true});
+  for (const n of fs.readdirSync(a)) {
+    const from=path.join(a,n), to=path.join(b,n);
+    fs.renameSync(from,to); journal.push([from,to]);
+  }
+};
+const swap = (source, backup) => {
+  fs.mkdirSync(backup,{recursive:true});
+  if (fs.readdirSync(backup).length) throw new Error('UPDATE_BACKUP_NOT_EMPTY');
+  const journal=[];
+  try { move(app,backup,journal); move(source,app,journal); }
+  catch (error) {
+    const errors=[error];
+    for (const [from,to] of journal.reverse()) { try { fs.renameSync(to,from); } catch (e) { errors.push(e); } }
+    if (errors.length>1) throw new AggregateError(errors,'UPDATE_MOVE_RECOVERY_FAILED',{cause:error});
+    throw error;
+  }
+};
+const launch = async () => {
+  const child=cp.spawn(process.execPath,[path.join(app,'launcher.mjs')],{cwd:app,detached:true,stdio:'ignore',windowsHide:true});
+  const observed={child,stopped:false};
+  child.once('exit',()=>{observed.stopped=true;});
+  await new Promise((resolve,reject)=>{child.once('spawn',resolve);child.once('error',reject);});
+  child.unref();
+  return observed;
+};
+for (let i=0;i<200 && alive(parentPid);i++) await sleep(100);
+if (alive(parentPid)) { fs.rmSync(lock,{force:true}); process.exit(3); }
+fs.rmSync(clientLock,{force:true});
+try {
+  swap(stage,previous);
+  try { fs.rmSync(path.join(app,'nc-agent.exe'),{force:true}); } catch {}
+  ${supervisorWrite}${supervisorMjsWrite}
+} catch (error) { if (!(error instanceof AggregateError)) fs.rmSync(lock,{force:true}); throw error; }
+// Keep the supervisor interlock until this exact candidate is healthy or
+// stopped and rolled back. Never snapshot the old pidFile as the candidate.
+let candidate=null;
+try { candidate=await launch(); } catch {}
+if (candidate) {
+  for (let i=0;i<250 && !candidate.stopped && !fs.existsSync(marker);i++) await sleep(100);
+  if (!candidate.stopped && fs.existsSync(marker)) { fs.rmSync(lock,{force:true}); process.exit(0); }
+}
+if (candidate && !candidate.stopped) {
+  // No native spawn-bound process handle is retained here. PID/CIM snapshots,
+  // even with matching creation time and image, cannot authorize a signal.
+  throw new Error('UPDATE_CANDIDATE_NOT_STOPPED');
+}
+// Exit observation, not a sent signal, authorizes mutation of the app tree.
+swap(previous,failed);
+fs.rmSync(${v(layout.updateState)},{force:true});
+await launch();
+fs.rmSync(lock,{force:true});
+`;
 }
 
 /**
@@ -1383,6 +1690,9 @@ export function isActivationBusyError(error) {
  * @property {number|null} [serviceUid]
  * @property {number|null} [serviceGid]
  * @property {(() => unknown)|null} [hasLiveSessions] interlock probe (see activationInterlock).
+ * @property {string} [jobId]
+ * @property {(() => Promise<() => void>)|null} [quiesce] stop admission and drain normal runtime work.
+ * @property {(() => void)|null} [onHandoff]
  */
 /**
  * @typedef {object} UpdateActivation
@@ -1394,14 +1704,50 @@ export function isActivationBusyError(error) {
  * @property {string} activated_at
  * @property {boolean} [rolled_back]
  */
+/** @type {Map<string, Promise<UpdateActivation>>} */
+const activationClaims = new Map();
+/** @type {Promise<unknown>} */
+let activationQueue = Promise.resolve();
+
+// Claim synchronously, before any await: HTTP completion and WS ACK share
+// the same prepared-tree identity even when they refer to different job IDs.
 /**
  * @param {unknown} result
  * @param {ActivationOptions} [options]
  * @returns {Promise<UpdateActivation>}
  */
-export async function activatePreparedUpdate(
+export function activatePreparedUpdate(result, options = {}) {
+  const payload = /** @type {{result_payload?: {version?: unknown, stage_dir?: unknown}}} */ (result || {}).result_payload || {};
+  const key = JSON.stringify([path.resolve((options.layout || ncLayout()).app), payload.version, path.resolve(String(payload.stage_dir || ''))]);
+  const existing = activationClaims.get(key);
+  if (existing) return existing;
+  let handedOff = false;
+  /** @type {null | (() => void)} */
+  let resume = null;
+  const claimed = activationQueue.then(async () => {
+    try {
+      if (options.quiesce) resume = await options.quiesce();
+      return await activatePreparedUpdateImpl(result, {
+        ...options,
+        onHandoff: () => { handedOff = true; options.onHandoff?.(); }
+      });
+    } catch (error) {
+      // Failed reverse renames leave the old module tree incomplete. Keep
+      // admission closed until operator recovery, even before lock handoff.
+      if (!handedOff && error?.oldTreeRestored !== false) resume?.();
+      if (isActivationBusyError(error)) activationClaims.delete(key);
+      throw error;
+    }
+  });
+  activationClaims.set(key, claimed);
+  activationQueue = claimed.catch(() => {});
+  return claimed;
+}
+
+/** @param {unknown} result @param {ActivationOptions} options */
+async function activatePreparedUpdateImpl(
   result,
-  { layout = ncLayout(), clientId = '', serviceUid = null, serviceGid = null, hasLiveSessions = null } = {}
+  { layout = ncLayout(), clientId = '', serviceUid = null, serviceGid = null, hasLiveSessions = null, onHandoff = null } = {}
 ) {
   // Interlock first: a refused activation must leave zero state behind
   // (no prune, no state file, no swap) so retrying later is always safe.
@@ -1500,7 +1846,9 @@ export async function activatePreparedUpdate(
       stdio: 'ignore',
       windowsHide: true
     });
+    await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
     child.unref();
+    onHandoff?.();
     setTimeout(() => process.kill(process.pid, 'SIGTERM'), 800).unref();
     return activation;
   }
@@ -1549,7 +1897,7 @@ export async function activatePreparedUpdate(
   try {
     await fs.rm(path.join(layout.app, 'nc-agent.exe'), { force: true });
   } catch {}
-  return superviseActivation({ layout, previous, failed, marker, activation });
+  return superviseActivation({ layout, previous, failed, marker, activation, onHandoff });
 }
 
 /**
@@ -1567,6 +1915,7 @@ export async function activatePreparedUpdate(
  * @param {string} [args.entry]
  * @param {number} [args.timeoutMs]
  * @param {boolean} [args.killSelf]
+ * @param {(() => void)|null} [args.onHandoff]
  * @returns {Promise<UpdateActivation>}
  */
 export async function superviseActivation({
@@ -1577,7 +1926,8 @@ export async function superviseActivation({
   activation,
   entry = path.join(layout.app, 'launcher.mjs'),
   timeoutMs = 30000,
-  killSelf = true
+  killSelf = true,
+  onHandoff = null
 } = /** @type {any} */ ({})) {
   // In-process supervision (replaces the detached watchdog file): the
   // updater is the proven-stable old release, so IT watches for the healthy
@@ -1594,17 +1944,34 @@ export async function superviseActivation({
   // the old process is minutes from SIGTERM and needs no lock for watching.
   try {
     await releaseHeldLock(layout.lockFile);
-  } catch {}
-  const supervised = spawn(process.execPath, [entry], {
+  } catch (error) {
+    // The app has already been swapped when supervision starts. A failed
+    // lock release does not restore the old tree or permit old admission.
+    throw Object.assign(error, { oldTreeRestored: false });
+  }
+  onHandoff?.();
+  // L06-9: spawn-time identity for the verified rollback kill below
+  // (PID-reuse guard — the supervised child must still be ours at kill
+  // time, or the SIGKILL is refused fail-closed).
+  const supervisedSpawnedAt = new Date().toISOString();
+  const supervisedArgs = [entry];
+  const supervised = spawn(process.execPath, supervisedArgs, {
     detached: true,
     stdio: 'ignore',
     windowsHide: true
+  });
+  const supervisedIdentity = captureSpawnIdentity(supervised);
+  let stopped = false;
+  supervised.once('exit', () => { stopped = true; });
+  const started = await new Promise((resolve) => {
+    supervised.once('spawn', () => resolve(true));
+    supervised.once('error', () => { if (!supervised.pid) stopped = true; resolve(false); });
   });
   supervised.unref();
   const bye = () => {
     if (killSelf) setTimeout(() => process.kill(process.pid, 'SIGTERM'), 800).unref();
   };
-  const marked = await waitForFile(marker, timeoutMs);
+  const marked = started && await waitForFile(marker, timeoutMs);
   if (marked) {
     bye();
     return activation;
@@ -1612,11 +1979,25 @@ export async function superviseActivation({
   // No marker: the new release failed to boot healthy. Roll back to the
   // previous tree (proven running minutes ago), clear the pending state so
   // the restored release boots clean, and exit for the supervisor to relaunch.
-  try {
-    supervised.kill('SIGKILL');
-  } catch {}
-  await moveDirContents(layout.app, failed);
-  await moveDirContents(previous, layout.app);
+  // L06-9: the rollback kill is identity-verified (never a blind PID
+  // signal): the recorded spawn descriptor travels with the call and a
+  // recycled PID fails closed instead of receiving SIGKILL.
+  if (!stopped) {
+    const termination = await terminateSessionTreeAsync(supervised, {
+      platform: process.platform,
+      force: true,
+      graceMs: 0,
+      expectedIdentity: supervisedIdentity,
+      expectedStartedAt: supervisedSpawnedAt,
+      expectedPath: process.execPath,
+      expectedCommandLine: supervisedArgs.map(String)
+    });
+    if (!termination.signaled && !stopped) throw new Error('UPDATE_CANDIDATE_IDENTITY_UNVERIFIED');
+    const deadline = Date.now() + 10000;
+    while (!stopped && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
+    if (!stopped) throw new Error('UPDATE_CANDIDATE_NOT_STOPPED');
+  }
+  await swapAppContents(previous, { layout, previous: failed });
   try {
     await fs.rm(layout.updateState, { force: true });
   } catch {}
