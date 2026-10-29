@@ -925,9 +925,13 @@ export async function browserFindJob(job) {
             page_id: cur?.pageId || null,
             page_revision: found.page_revision,
             snapshot_id: found.snapshot_id,
-            url: found.url,
-            title: found.title,
-            matches: found.matches,
+            url: auditProjectionUrl(found.url),
+            title: redactSecretText(found.title).slice(0, 2000),
+            matches: found.matches.map((match) => ({
+              ref: match.ref,
+              line: match.line,
+              snippet: redactSecretText(match.snippet).slice(0, 1200)
+            })),
             truncated: found.truncated
           },
           `${found.matches.length} match(es)${found.truncated ? ' (truncated)' : ''}`
@@ -1182,13 +1186,21 @@ export async function browserConsoleJob(job) {
   } catch (e) {
     return failJob(started, mapBrowserError(e), key !== DEFAULT_SESSION ? { browser_id: key } : {});
   }
-  const messages = session.console
-    .filter((m) => (CONSOLE_SEVERITY[m.type] ?? 3) <= rank && m.seq > cursor)
-    .slice(-limit);
+  const eligible = session.console
+    .filter((m) => (CONSOLE_SEVERITY[m.type] ?? 3) <= rank && m.seq > cursor);
+  const ordered = p.ordered === true;
+  const messages = ordered ? eligible.slice(0, limit) : eligible.slice(-limit);
+  const oldestCursor = Math.max(0, (session.console[0]?.seq ?? 1) - 1);
   session.touch();
   return okJob(started, {
     browser_id: key === DEFAULT_SESSION ? null : key,
-    cursor: session.consoleSeq,
+    // An empty/filtered page does not acknowledge records it did not return.
+    cursor: ordered ? (messages.at(-1)?.seq ?? cursor) : session.consoleSeq,
+    ...(ordered ? {
+      truncated: eligible.length > limit,
+      cursor_expired: cursor < oldestCursor,
+      oldest_cursor: oldestCursor
+    } : {}),
     messages
   });
 }
@@ -1225,13 +1237,20 @@ export async function browserNetworkJob(job) {
   const limit = Math.max(1, Math.min(500, Number(p.limit || 100)));
   const cursor = Math.max(0, Number(p.cursor || 0));
   const re = typeof p.filter === 'string' && p.filter ? new RegExp(p.filter) : null;
-  const requests = session.network
-    .filter((r) => r.seq > cursor && (!re || re.test(r.url)))
-    .slice(-limit);
+  const eligible = session.network
+    .filter((r) => r.seq > cursor && (!re || re.test(r.url)));
+  const ordered = p.ordered === true;
+  const requests = ordered ? eligible.slice(0, limit) : eligible.slice(-limit);
+  const oldestCursor = Math.max(0, (session.network[0]?.seq ?? 1) - 1);
   session.touch();
   return okJob(started, {
     browser_id: key === DEFAULT_SESSION ? null : key,
-    cursor: session.networkSeq,
+    cursor: ordered ? (requests.at(-1)?.seq ?? cursor) : session.networkSeq,
+    ...(ordered ? {
+      truncated: eligible.length > limit,
+      cursor_expired: cursor < oldestCursor,
+      oldest_cursor: oldestCursor
+    } : {}),
     requests
   });
 }

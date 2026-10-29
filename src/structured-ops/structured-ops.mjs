@@ -70,8 +70,32 @@ export async function openRegularForRead(file, fsApi = fs) {
     throw e;
   }
 }
-export async function readBounded(file, max, fsApi = fs) {
-  const limit = Math.max(1, Math.min(65536, Number(max) || 65536));
+function readOffset(/** @type {unknown} */ value = 0) {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0)
+    throw new MutationError('INVALID_ARGUMENT', { argument: 'offset', reason: 'Expected a nonnegative safe integer byte offset.' });
+  return value;
+}
+
+// Invalid bytes retain Buffer's replacement decoding. Only complete, valid
+// UTF-8 sequences constrain page boundaries; never hash the decoded string.
+function utf8Width(buf, at) {
+  const lead = buf[at];
+  const width = lead >= 0xc2 && lead <= 0xdf ? 2
+    : lead >= 0xe0 && lead <= 0xef ? 3
+      : lead >= 0xf0 && lead <= 0xf4 ? 4 : 1;
+  if (at + width > buf.length) return 1;
+  for (let i = 1; i < width; i++) {
+    if ((buf[at + i] & 0xc0) !== 0x80) return 1;
+  }
+  const second = buf[at + 1];
+  if ((lead === 0xe0 && second < 0xa0) || (lead === 0xed && second >= 0xa0) ||
+      (lead === 0xf0 && second < 0x90) || (lead === 0xf4 && second >= 0x90)) return 1;
+  return width;
+}
+
+export async function readBounded(file, max, fsApi = fs, offset = 0) {
+  const requestedOffset = readOffset(offset);
+  const limit = Math.max(1, Math.min(65536, Math.trunc(Number(max)) || 65536));
   // P28-S2: pre-open regular-file guard. Opening a FIFO for reading blocks
   // until a writer appears and this path has no timeout, so a planted FIFO
   // inside the workspace would hang the job. Reject non-regular files
@@ -80,13 +104,39 @@ export async function readBounded(file, max, fsApi = fs) {
   const fh = await openRegularForRead(file, fsApi);
   try {
     const st = await fh.stat();
-    const n = Math.min(st.size, limit);
+    const actualOffset = Math.min(requestedOffset, st.size);
+    // Three bytes on either side suffice to recognize a four-byte code point.
+    // Storage and I/O remain bounded, independent of total file size.
+    const start = Math.max(0, actualOffset - 3);
+    const prefix = actualOffset - start;
+    const n = Math.min(st.size - start, prefix + limit + 3);
     const buf = Buffer.alloc(n);
-    const read = n > 0 ? await readExact(fh, buf, n, 0) : 0;
+    const read = n > 0 ? await readExact(fh, buf, n, start) : 0;
+    const raw = buf.subarray(0, read);
+    let end = 0;
+    while (end < prefix) end += utf8Width(raw, end);
+    if (end !== prefix)
+      throw new MutationError('INVALID_ARGUMENT', { argument: 'offset', reason: 'Byte offset is inside a UTF-8 character; use the returned next_offset.' });
+    const budgetEnd = Math.min(read, prefix + limit);
+    while (end < budgetEnd) {
+      const width = utf8Width(raw, end);
+      if (end + width > budgetEnd) break;
+      end += width;
+    }
+    if (end === prefix && actualOffset < st.size)
+      throw new MutationError('INVALID_ARGUMENT', { argument: 'max_bytes', reason: 'No complete character fits this page; increase max_bytes or restart if the file changed.' });
+    const bytesRead = Math.max(0, end - prefix);
+    const truncated = actualOffset + bytesRead < st.size;
+    const page = raw.subarray(prefix, end);
     return {
-      content: buf.subarray(0, read).toString('utf8'),
+      content: page.toString('utf8'),
       bytes: st.size,
-      truncated: st.size > limit
+      truncated,
+      offset: actualOffset,
+      next_offset: truncated ? actualOffset + bytesRead : null,
+      mtime: st.mtime?.toISOString?.() || null,
+      sha256: requestedOffset === 0 && !truncated && bytesRead === st.size
+        ? crypto.createHash('sha256').update(page).digest('hex') : null
     };
   } finally {
     await fh.close();
@@ -547,18 +597,20 @@ export function makeStructuredHandlers({
       const extraRoots = policyExtraRoots(job);
       const roots = [...readRoots, ...extraRoots.read];
       const allowAllRoots = extraRoots.allowAll === true;
+      let offset = 0;
       try {
+        offset = readOffset(p.offset);
         const file = await realAllowed(String(p.path || ''), roots, allowAllRoots, readOpts),
           max = Math.max(1, Math.min(65536, Number(p.max_bytes || 65536))),
-          r = await readBounded(file, max, fsApi);
+          r = await readBounded(file, max, fsApi, offset);
         return ok({
           path: file,
-          content: r.content,
-          bytes: r.bytes,
-          truncated: r.truncated
+          ...r
         });
       } catch (e) {
-        if (isAccessDeniedError(e) && allowAllRoots) {
+        // The signed helper protocol has no byte offset. Never relabel its
+        // byte-zero output as a continuation or broaden its authority.
+        if (offset === 0 && isAccessDeniedError(e) && allowAllRoots) {
           try {
             const helperRes = await dispatchHelperFileRead({
               path: String(p.path || ''),
@@ -595,6 +647,7 @@ export function makeStructuredHandlers({
       try {
         const rawPaths = Array.isArray(p.paths) ? p.paths : [];
         if (rawPaths.length < 1 || rawPaths.length > 10) throw new Error('PATH_COUNT_INVALID');
+        const offset = readOffset(p.offset);
         const max = Math.max(1, Math.min(65536, Number(p.max_bytes || 65536)));
         const extraRoots = policyExtraRoots(job);
         const roots = [...readRoots, ...extraRoots.read];
@@ -603,17 +656,15 @@ export function makeStructuredHandlers({
         for (const raw of rawPaths.slice(0, 10)) {
           try {
             const file = await realAllowed(String(raw || ''), roots, allowAllRoots, readOpts),
-              r = await readBounded(file, max, fsApi);
+              r = await readBounded(file, max, fsApi, offset);
             results.push({
               path: file,
-              content: r.content,
-              bytes: r.bytes,
-              truncated: r.truncated,
+              ...r,
               error: null
             });
           } catch (e) {
             let helperRes = null;
-            if (isAccessDeniedError(e) && allowAllRoots) {
+            if (offset === 0 && isAccessDeniedError(e) && allowAllRoots) {
               try {
                 helperRes = await dispatchHelperFileRead({
                   path: String(raw || ''),
@@ -644,7 +695,9 @@ export function makeStructuredHandlers({
                 content: '',
                 bytes: 0,
                 truncated: false,
-                error: String(errorRecord?.message || e)
+                error: offset > 0 && isAccessDeniedError(e)
+                  ? mapFileError(e) : String(errorRecord?.message || e),
+                ...(denialContext(e) ? { details: denialContext(e) } : {})
               });
             }
           }

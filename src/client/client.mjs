@@ -246,7 +246,7 @@ try {
   ensureDaemonPath();
 } catch {}
 
-const VERSION = '0.17.42';
+const VERSION = '0.17.43';
 const layout = ncLayout();
 const serverUrl = (process.env.NC_SERVER_URL || 'https://mcp.nodecommand.app').replace(/\/$/, '');
 if (process.env.NODE_ENV !== 'development') {
@@ -1812,6 +1812,7 @@ function sessionHello() {
       BROWSER_POLICY_FEATURE,
       BROWSER_POLICY_V2_FEATURE,
       WORKSPACE_ROOTS_FEATURE,
+      'process_stdin_eof_v1',
       // Darwin agents advertise file_permissions but never
       // privileged_shell_exec (GAP-017): the helper feature must follow
       // either capability, or the central plan would see no helper

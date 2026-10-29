@@ -353,10 +353,9 @@ export async function fileWriteMutation(
   const expected = validateSha(payload?.expected_sha256, hasOwn(payload, 'expected_sha256'));
   if (mode === 'create' && hasOwn(payload, 'expected_sha256'))
     err('EXPECTED_SHA_NOT_ALLOWED_FOR_CREATE');
-  // Accepted for backward compatibility (capability derivation still reads
-  // it); parent directories are now ALWAYS provisioned (TOOL_DESIGN L2),
-  // so the value no longer gates success.
-  optionalBoolean(payload, 'create_parents', 'INVALID_CREATE_PARENTS');
+  // Omission preserves automatic provisioning; explicit false forbids it.
+  const createParents = hasOwn(payload, 'create_parents')
+    ? optionalBoolean(payload, 'create_parents', 'INVALID_CREATE_PARENTS') : true;
   const normalized = normalizeMutationPath(/** @type {string} */ (payload?.path), {
     pathApi,
     cwd,
@@ -400,10 +399,7 @@ export async function fileWriteMutation(
     let previousSha = null;
     const needsCreate = !exists;
     if (needsCreate) {
-      // Automatic parent provisioning (L2): never fail closed with
-      // PARENT_NOT_FOUND on a standard write; re-authorize afterwards so
-      // the ban still sees the final resolved ancestor.
-      await fsApi.mkdir(parent, { recursive: true });
+      if (createParents) await fsApi.mkdir(parent, { recursive: true });
       parentAuth = await authorizeLeafParent(normalized, options);
       rootTargetForbidden(normalized, parentAuth.real_roots, pathApi);
       st = await lstatOrNull(normalized, fsApi);
@@ -542,9 +538,8 @@ export async function fileWriteMutation(
  * @param {string} [options.homedir] `~` expansion base
  */
 export async function directoryCreateMutation(payload, { roots, allowAll = false, fsApi = fs, pathApi = path, treeBan = null, cwd = null, homedir = null } = {}) {
-  // Accepted for backward compatibility; intermediate directories are now
-  // ALWAYS created (TOOL_DESIGN L2), so the value no longer gates success.
-  optionalBoolean(payload, 'parents', 'INVALID_PARENTS');
+  const parents = hasOwn(payload, 'parents')
+    ? optionalBoolean(payload, 'parents', 'INVALID_PARENTS') : true;
   const normalized = normalizeMutationPath(/** @type {string} */ (payload?.path), {
     pathApi,
     cwd,
@@ -560,7 +555,7 @@ export async function directoryCreateMutation(payload, { roots, allowAll = false
       if (!current.isDirectory() || current.isSymbolicLink()) err('PATH_TYPE_NOT_SUPPORTED');
       return { path: normalized, created: false };
     }
-    await fsApi.mkdir(normalized, { recursive: true });
+    await fsApi.mkdir(normalized, { recursive: parents });
     const created = await lstatOrNull(normalized, fsApi);
     if (!created || !created.isDirectory() || created.isSymbolicLink())
       err('PATH_TYPE_NOT_SUPPORTED');
@@ -1709,6 +1704,11 @@ async function dispatchHelperMutation({
                           ? 'move'
                           : 'write')
                   ).toLowerCase();
+
+  // Legacy helpers provision parents unconditionally for writes and use a
+  // different mkdir flag. Do not drop explicit false or rewrite signed data.
+  if ((action === 'write' && payload.create_parents === false) ||
+      (action === 'mkdir' && payload.parents === false)) throw directError;
 
   /** @type {Record<string, unknown>} */
   const helperPayload = {

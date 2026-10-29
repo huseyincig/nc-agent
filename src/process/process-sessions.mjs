@@ -185,6 +185,7 @@ export function sanitizedSessionEnv(extra = null) {
  * @property {number} stdoutDroppedBytes bytes discarded past the stream cap
  * @property {number} stderrDroppedBytes bytes discarded past the stream cap
  * @property {boolean} exited
+ * @property {boolean} outputClosed
  * @property {boolean} [detached] POSIX detached group leader (A5: group watchdog keeps running after leader exit)
  * @property {number|null} exitCode
  * @property {unknown} exitSignal
@@ -729,6 +730,7 @@ export function startSession(
     stdoutDroppedBytes: 0,
     stderrDroppedBytes: 0,
     exited: false,
+    outputClosed: false,
     exitCode: null,
     exitSignal: null,
     lastActivityMs: now,
@@ -804,6 +806,7 @@ export function startSession(
     session.emitter?.emit('exit');
   });
   child.once('close', () => {
+    session.outputClosed = true;
     session.emitter?.emit('exit');
   });
   const timeout = setTimeout(() => {
@@ -858,21 +861,29 @@ export function readSession(session, stdoutCursor, stderrCursor, maxBytes) {
     stderr_truncated: session.stderrDroppedBytes > 0 || stderrCut,
     stderr_dropped_bytes: session.stderrDroppedBytes,
     exited: session.exited,
-    exit_code: session.exitCode
+    exit_code: session.exitCode,
+    signal: session.exitSignal ?? null,
+    // Exit can precede the final pipe data. EOF requires closed streams and
+    // a drained page, regardless of whether the child succeeded.
+    eof: session.outputClosed === true && !stdoutCut && !stderrCut
   };
 }
 
 /**
  * @param {ProcessSession} session
  * @param {string} data
+ * @param {boolean} [eof]
  */
-export function writeSession(session, data) {
+export function writeSession(session, data, eof = false) {
+  if (typeof data !== 'string' || typeof eof !== 'boolean')
+    return { ok: false, error: 'INVALID_ARGUMENT' };
   if (session.exited) return { ok: false, error: 'PROCESS_EXITED' };
-  if (!session.child.stdin || session.child.stdin.destroyed)
+  if (!session.child.stdin || session.child.stdin.destroyed || session.child.stdin.writableEnded)
     return { ok: false, error: 'PROCESS_STDIN_CLOSED' };
   if (Buffer.byteLength(data, 'utf8') + (session.child.stdin.writableLength || 0) > MAX_INPUT_BYTES)
     return { ok: false, error: 'INPUT_TOO_LARGE' };
   session.child.stdin.write(data);
+  if (eof) session.child.stdin.end();
   session.lastActivityMs = Date.now();
   return { ok: true };
 }
@@ -1338,8 +1349,10 @@ export async function processInputJob(job) {
     const initialStdoutBytes = session.stdoutBytes;
     const initialStderrBytes = session.stderrBytes;
 
-    const data = p.data !== undefined && p.data !== null ? String(p.data) : '';
-    const w = writeSession(session, data);
+    if (p.data !== undefined && typeof p.data !== 'string') return fail('INVALID_ARGUMENT');
+    if (p.eof !== undefined && typeof p.eof !== 'boolean') return fail('INVALID_ARGUMENT');
+    const data = typeof p.data === 'string' ? p.data : '';
+    const w = writeSession(session, data, p.eof === true);
     if (!w.ok) return fail(w.error);
 
     if (!waitForPrompt) {
@@ -1561,8 +1574,8 @@ export function makeProcessHandlers(
           const tombSession = /** @type {ProcessSession} */ (tomb.session);
           const r = readSession(
             tombSession,
-            Math.max(0, Number(p.stdout_cursor ?? 0)),
-            Math.max(0, Number(p.stderr_cursor ?? 0)),
+            Math.max(0, Number(p.stdout_cursor ?? p.cursor ?? 0)),
+            Math.max(0, Number(p.stderr_cursor ?? p.cursor ?? 0)),
             Math.max(1, Math.min(262144, Number(p.max_bytes ?? 65536)))
           );
           return ok({

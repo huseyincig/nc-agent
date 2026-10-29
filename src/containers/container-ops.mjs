@@ -482,6 +482,28 @@ async function gatedDir(job, baseRoots, write = false) {
 }
 
 /**
+ * Project only bounded diagnostics from the already retrieved engine record.
+ * @param {Record<string, any>} info
+ */
+function containerDiagnostics(info) {
+  const exitCode = info.State?.ExitCode;
+  const oomKilled = info.State?.OOMKilled;
+  const restartCount = info.RestartCount;
+  const restartPolicy = info.HostConfig?.RestartPolicy?.Name;
+  const composeWorkingDir = info.Config?.Labels?.['com.docker.compose.project.working_dir'];
+  return {
+    exit_code: Number.isSafeInteger(exitCode) ? exitCode : null,
+    oom_killed: typeof oomKilled === 'boolean' ? oomKilled : null,
+    restart_count: Number.isSafeInteger(restartCount) && restartCount >= 0 ? restartCount : null,
+    restart_policy: typeof restartPolicy === 'string' && /^[a-z][a-z0-9-]{0,63}$/i.test(restartPolicy)
+      ? restartPolicy : null,
+    compose_working_dir: typeof composeWorkingDir === 'string' && composeWorkingDir.length > 0 &&
+      composeWorkingDir.length <= 4096 && !/[\u0000-\u001f\u007f]/.test(composeWorkingDir)
+      ? composeWorkingDir : null
+  };
+}
+
+/**
  * @param {object} [options]
  * @param {Array<string>} [options.readRoots]
  * @param {Array<string>} [options.writeRoots]
@@ -596,7 +618,8 @@ export function makeContainerHandlers({ readRoots = [], writeRoots = [], appRoot
           image: String(info.Image ?? info.image ?? imgCfg.Image ?? ''),
           state: String(state.Status ?? state.status ?? ''),
           running: state.Running === true,
-          mounts: Array.isArray(info.Mounts) ? info.Mounts.length : null
+          mounts: Array.isArray(info.Mounts) ? info.Mounts.length : null,
+          ...containerDiagnostics(info)
         });
       } catch (e) {
         let mappedMessage = 'CONTAINER_OP_FAILED';
@@ -638,6 +661,7 @@ export function makeContainerHandlers({ readRoots = [], writeRoots = [], appRoot
               state: String(state.Status ?? state.status ?? ''),
               running: state.Running === true,
               mounts: Array.isArray(info.Mounts) ? info.Mounts.length : null,
+              ...containerDiagnostics(info),
               privileged: true
             });
           } catch {

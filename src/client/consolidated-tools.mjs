@@ -198,6 +198,10 @@ async function processManage(job, atomic) {
   if (action === 'read') {
     const h = requireHandler(atomic, 'process_output');
     if (!h) return fail('UNSUPPORTED_TOOL:process_manage');
+    if ((p.offset !== undefined && p.cursor !== undefined && p.offset !== p.cursor) ||
+        (p.length !== undefined && p.max_bytes !== undefined && p.length !== p.max_bytes)) {
+      return fail('INVALID_ARGUMENT');
+    }
     return h(
       subJob(job, {
         process_id: id,
@@ -214,7 +218,8 @@ async function processManage(job, atomic) {
     return h(
       subJob(job, {
         process_id: id,
-        data: String(p.data ?? ''),
+        data: p.data === undefined ? '' : p.data,
+        ...(p.eof !== undefined ? { eof: p.eof } : {}),
         ...(p.wait_for_prompt !== undefined ? { wait_for_prompt: p.wait_for_prompt } : {}),
         ...(p.timeout_ms !== undefined ? { timeout_ms: p.timeout_ms } : {})
       })
@@ -310,6 +315,12 @@ async function browserManage(job, atomic) {
         ...(p.url !== undefined ? { url: p.url } : {})
       })
     );
+  }
+  if (action === 'find' || action === 'console' || action === 'network') {
+    const names = { find: 'browser_find', console: 'browser_console_messages', network: 'browser_network_requests' };
+    const h = requireHandler(atomic, names[action]);
+    if (!h) return fail('UNSUPPORTED_TOOL:browser_manage');
+    return h(subJob(job, action === 'find' ? {} : { ordered: true }));
   }
   if (action === 'upload') {
     const h = requireHandler(atomic, 'browser_file_upload');
